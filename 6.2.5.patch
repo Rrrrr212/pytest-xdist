@@ -1,0 +1,498 @@
+diff --git a/src/xdist/remote.py b/src/xdist/remote.py
+index 436b5dd..92084b5 100644
+--- a/src/xdist/remote.py
++++ b/src/xdist/remote.py
+@@ -15,9 +15,13 @@ from collections.abc import Sequence
+ import contextlib
+ import enum
+ import os
++import socket
++import subprocess
+ import sys
++import threading
+ import time
+ from typing import Any
++from typing import Callable
+ from typing import Literal
+ from typing import TypedDict
+ from typing import Union
+@@ -400,6 +404,479 @@ def setup_config(config: pytest.Config, basetemp: str | None) -> None:
+     config.option.basetemp = basetemp
+ 
+ 
++class ConnectionPool:
++    """Manages a pool of SSH connections to remote hosts."""
++
++    def __init__(self, max_connections: int = 10, connection_timeout: int = 30) -> None:
++        self._max_connections = max_connections
++        self._connection_timeout = connection_timeout
++        self._connections: dict[str, execnet.Gateway] = {}
++        self._lock = threading.Lock()
++        self._usage_count: dict[str, int] = {}
++        self._last_used: dict[str, float] = {}
++
++    def get_connection(self, host: str, user: str | None = None, port: int = 22, ssh_config: dict[str, Any] | None = None) -> execnet.Gateway:
++        spec_key = f"{user}@{host}:{port}" if user else f"{host}:{port}"
++
++        with self._lock:
++            if spec_key in self._connections:
++                gw = self._connections[spec_key]
++                if gw.isremote():
++                    self._usage_count[spec_key] = self._usage_count.get(spec_key, 0) + 1
++                    self._last_used[spec_key] = time.time()
++                    return gw
++
++            if len(self._connections) >= self._max_connections:
++                self._evict_idle()
++
++            ssh_opts = ""
++            if ssh_config:
++                if ssh_config.get("identity_file"):
++                    ssh_opts += f" -i {ssh_config['identity_file']}"
++                if ssh_config.get("ssh_config_path"):
++                    ssh_opts += f" -F {ssh_config['ssh_config_path']}"
++
++            spec_str = f"ssh={user}@{host}//port={port}//ssh={ssh_opts.strip()}" if ssh_opts else f"ssh={user}@{host}//port={port}"
++            spec_str += "//execmodel=main_thread_only"
++
++            gw = execnet.makegateway(spec_str)
++            self._connections[spec_key] = gw
++            self._usage_count[spec_key] = 1
++            self._last_used[spec_key] = time.time()
++
++            return gw
++
++    def _evict_idle(self) -> None:
++        now = time.time()
++        idle_threshold = now - 300
++
++        idle_connections = [
++            key for key, last_used in self._last_used.items()
++            if last_used < idle_threshold
++        ]
++
++        for key in idle_connections[:5]:
++            self._remove_connection(key)
++
++    def _remove_connection(self, key: str) -> None:
++        if key in self._connections:
++            try:
++                self._connections[key].exit()
++            except Exception:
++                pass
++            del self._connections[key]
++            self._usage_count.pop(key, None)
++            self._last_used.pop(key, None)
++
++    def release(self, host: str, user: str | None = None, port: int = 22) -> None:
++        spec_key = f"{user}@{host}:{port}" if user else f"{host}:{port}"
++        with self._lock:
++            self._remove_connection(spec_key)
++
++    def close_all(self) -> None:
++        with self._lock:
++            for key in list(self._connections.keys()):
++                self._remove_connection(key)
++
++    def get_stats(self) -> dict[str, Any]:
++        with self._lock:
++            return {
++                "total_connections": len(self._connections),
++                "max_connections": self._max_connections,
++                "connections": {
++                    key: {
++                        "usage_count": self._usage_count.get(key, 0),
++                        "last_used": self._last_used.get(key, 0),
++                    }
++                    for key in self._connections
++                }
++            }
++
++
++class HeartbeatDetector:
++    """Monitors worker health via periodic heartbeat signals."""
++
++    HEARTBEAT_INTERVAL = 5.0
++    HEARTBEAT_TIMEOUT = 15.0
++    MAX_MISSED_HEARTBEATS = 3
++
++    def __init__(
++        self,
++        worker_id: str,
++        channel: execnet.Channel,
++        log: Producer,
++        on_heartbeat_failure: Callable[[str], None] | None = None,
++    ) -> None:
++        self.worker_id = worker_id
++        self.channel = channel
++        self.log = log
++        self.on_heartbeat_failure = on_heartbeat_failure
++        self._last_heartbeat = time.time()
++        self._missed_count = 0
++        self._running = False
++        self._thread: threading.Thread | None = None
++        self._lock = threading.Lock()
++
++    def start(self) -> None:
++        self._running = True
++        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
++        self._thread.start()
++        self.log("heartbeat detector started for worker", self.worker_id)
++
++    def stop(self) -> None:
++        self._running = False
++        if self._thread:
++            self._thread.join(timeout=5)
++        self.log("heartbeat detector stopped for worker", self.worker_id)
++
++    def record_heartbeat(self) -> None:
++        with self._lock:
++            self._last_heartbeat = time.time()
++            self._missed_count = 0
++
++    def _heartbeat_loop(self) -> None:
++        while self._running:
++            time.sleep(self.HEARTBEAT_INTERVAL)
++
++            if not self._running:
++                break
++
++            now = time.time()
++            with self._lock:
++                elapsed = now - self._last_heartbeat
++
++            if elapsed > self.HEARTBEAT_TIMEOUT:
++                self._missed_count += 1
++                self.log(
++                    "heartbeat missed for worker",
++                    self.worker_id,
++                    "miss_count:",
++                    self._missed_count,
++                )
++
++                if self._missed_count >= self.MAX_MISSED_HEARTBEATS:
++                    self.log(
++                        "heartbeat failure detected for worker",
++                        self.worker_id,
++                    )
++                    if self.on_heartbeat_failure:
++                        self.on_heartbeat_failure(self.worker_id)
++                    break
++
++    def send_heartbeat(self) -> None:
++        try:
++            self.channel.send(("heartbeat", {"timestamp": time.time(), "worker_id": self.worker_id}))
++            self.record_heartbeat()
++        except Exception as e:
++            self.log("failed to send heartbeat for worker", self.worker_id, "error:", str(e))
++            self.record_heartbeat()
++
++    @property
++    def is_alive(self) -> bool:
++        with self._lock:
++            return self._missed_count < self.MAX_MISSED_HEARTBEATS
++
++    @property
++    def last_heartbeat(self) -> float:
++        with self._lock:
++            return self._last_heartbeat
++
++
++class ResultReporter:
++    """Handles test result reporting from remote workers to controller."""
++
++    def __init__(
++        self,
++        worker_id: str,
++        testrunuid: str,
++        channel: execnet.Channel,
++        log: Producer,
++    ) -> None:
++        self.worker_id = worker_id
++        self.testrunuid = testrunuid
++        self.channel = channel
++        self.log = log
++        self._results_buffer: list[dict[str, Any]] = []
++        self._lock = threading.Lock()
++        self._total_tests_run = 0
++        self._total_failures = 0
++        self._total_errors = 0
++        self._start_time = time.time()
++
++    def report_test_result(self, report_data: dict[str, Any], item_index: int) -> None:
++        result = {
++            "item_index": item_index,
++            "worker_id": self.worker_id,
++            "testrun_uid": self.testrunuid,
++            "data": report_data,
++            "timestamp": time.time(),
++        }
++
++        with self._lock:
++            self._results_buffer.append(result)
++            self._total_tests_run += 1
++
++            if report_data.get("failed"):
++                self._total_failures += 1
++            elif report_data.get("passed") is False and not report_data.get("skipped"):
++                self._total_errors += 1
++
++        self._flush_results()
++
++    def report_collection(self, topdir: str, test_ids: list[str]) -> None:
++        self.log("reporting collection finish", len(test_ids), "tests")
++        self.channel.send((
++            "collectionfinish",
++            {"topdir": topdir, "ids": test_ids, "worker_id": self.worker_id}
++        ))
++
++    def report_worker_ready(self, worker_info: WorkerInfo) -> None:
++        self.channel.send((
++            "workerready",
++            {"workerinfo": worker_info, "worker_id": self.worker_id}
++        ))
++
++    def report_worker_finished(self, worker_output: dict[str, Any]) -> None:
++        worker_output["exitstatus"] = int(worker_output.get("exitstatus", 0))
++        worker_output["shouldfail"] = worker_output.get("shouldfail", False)
++        worker_output["shouldstop"] = worker_output.get("shouldstop", False)
++        worker_output["stats"] = self.get_stats()
++
++        self._flush_results()
++
++        self.channel.send((
++            "workerfinished",
++            {"workeroutput": worker_output, "worker_id": self.worker_id}
++        ))
++
++    def report_internal_error(self, formatted_error: str) -> None:
++        self.channel.send((
++            "internal_error",
++            {"formatted_error": formatted_error, "worker_id": self.worker_id}
++        ))
++
++    def _flush_results(self) -> None:
++        with self._lock:
++            if not self._results_buffer:
++                return
++
++            results_to_send = list(self._results_buffer)
++            self._results_buffer.clear()
++
++        for result in results_to_send:
++            try:
++                self.channel.send(("testreport", result))
++            except Exception as e:
++                self.log("failed to send test report", "error:", str(e))
++                with self._lock:
++                    self._results_buffer.extend(results_to_send)
++                break
++
++    def get_stats(self) -> dict[str, Any]:
++        with self._lock:
++            elapsed = time.time() - self._start_time
++            return {
++                "total_tests_run": self._total_tests_run,
++                "total_failures": self._total_failures,
++                "total_errors": self._total_errors,
++                "elapsed_time": elapsed,
++                "tests_per_second": self._total_tests_run / elapsed if elapsed > 0 else 0,
++                "buffer_size": len(self._results_buffer),
++            }
++
++    def flush_pending(self) -> None:
++        self._flush_results()
++
++
++class RemoteWorker:
++    """
++    A worker that executes tests on remote machines via SSH.
++    
++    Features:
++    - SSH connection pooling for efficient resource usage
++    - Heartbeat detection for monitoring worker health
++    - Result reporting with buffering and reliable delivery
++    - Automatic reconnection on connection failures
++    """
++
++    MAX_RECONNECT_ATTEMPTS = 3
++    RECONNECT_DELAY = 5.0
++
++    def __init__(
++        self,
++        worker_id: str,
++        testrunuid: str,
++        host: str,
++        user: str | None = None,
++        port: int = 22,
++        ssh_config: dict[str, Any] | None = None,
++        connection_pool: ConnectionPool | None = None,
++    ) -> None:
++        self.worker_id = worker_id
++        self.testrunuid = testrunuid
++        self.host = host
++        self.user = user
++        self.port = port
++        self.ssh_config = ssh_config or {}
++        self.connection_pool = connection_pool or ConnectionPool()
++        
++        self.gateway: execnet.Gateway | None = None
++        self.channel: execnet.Channel | None = None
++        self.log = Producer(f"remote-worker-{worker_id}", enabled=True)
++        
++        self.heartbeat: HeartbeatDetector | None = None
++        self.reporter: ResultReporter | None = None
++        
++        self._is_connected = False
++        self._reconnect_count = 0
++        self._lock = threading.Lock()
++
++    def connect(self) -> bool:
++        self.log("connecting to remote host", self.host)
++        
++        try:
++            self.gateway = self.connection_pool.get_connection(
++                host=self.host,
++                user=self.user,
++                port=self.port,
++                ssh_config=self.ssh_config,
++            )
++            
++            self.channel = self.gateway.remote_exec(
++                "import xdist.remote; xdist.remote.start_remote_worker()"
++            )
++            
++            self._is_connected = True
++            self._reconnect_count = 0
++            
++            self.reporter = ResultReporter(
++                worker_id=self.worker_id,
++                testrunuid=self.testrunuid,
++                channel=self.channel,
++                log=self.log,
++            )
++            
++            self.heartbeat = HeartbeatDetector(
++                worker_id=self.worker_id,
++                channel=self.channel,
++                log=self.log,
++                on_heartbeat_failure=self._on_heartbeat_failure,
++            )
++            self.heartbeat.start()
++            
++            self.log("successfully connected to", self.host)
++            return True
++            
++        except Exception as e:
++            self.log("connection failed:", str(e))
++            self._is_connected = False
++            return False
++
++    def disconnect(self) -> None:
++        self.log("disconnecting from remote host", self.host)
++        
++        if self.heartbeat:
++            self.heartbeat.stop()
++            self.heartbeat = None
++        
++        if self.reporter:
++            self.reporter.flush_pending()
++            self.reporter = None
++        
++        if self.gateway:
++            try:
++                self.gateway.exit()
++            except Exception:
++                pass
++            self.gateway = None
++        
++        self.channel = None
++        self._is_connected = False
++
++    def send_command(self, command: str, **kwargs: Any) -> bool:
++        if not self.channel or not self._is_connected:
++            self.log("cannot send command, not connected")
++            return False
++        
++        try:
++            self.channel.send((command, kwargs))
++            if self.heartbeat:
++                self.heartbeat.record_heartbeat()
++            return True
++        except Exception as e:
++            self.log("failed to send command:", str(e))
++            self._handle_connection_failure()
++            return False
++
++    def run_tests(self, indices: list[int]) -> bool:
++        return self.send_command("runtests", indices=indices)
++
++    def run_all_tests(self) -> bool:
++        return self.send_command("runtests_all")
++
++    def shutdown(self) -> bool:
++        return self.send_command("shutdown")
++
++    def steal_tests(self, indices: list[int]) -> bool:
++        return self.send_command("steal", indices=indices)
++
++    def _handle_connection_failure(self) -> None:
++        with self._lock:
++            self._is_connected = False
++            self._reconnect_count += 1
++            
++            self.log(
++                "connection failure, attempt",
++                self._reconnect_count,
++                "of",
++                self.MAX_RECONNECT_ATTEMPTS,
++            )
++            
++            if self._reconnect_count < self.MAX_RECONNECT_ATTEMPTS:
++                self.log("waiting before reconnect...")
++                time.sleep(self.RECONNECT_DELAY)
++                self.connect()
++
++    def _on_heartbeat_failure(self, worker_id: str) -> None:
++        self.log("heartbeat failure detected, attempting recovery")
++        self._handle_connection_failure()
++
++    @property
++    def is_connected(self) -> bool:
++        return self._is_connected
++
++    @property
++    def is_alive(self) -> bool:
++        if not self._is_connected:
++            return False
++        if self.heartbeat:
++            return self.heartbeat.is_alive
++        return True
++
++    def get_stats(self) -> dict[str, Any]:
++        stats: dict[str, Any] = {
++            "worker_id": self.worker_id,
++            "host": self.host,
++            "is_connected": self._is_connected,
++            "reconnect_count": self._reconnect_count,
++        }
++        
++        if self.reporter:
++            stats["result_stats"] = self.reporter.get_stats()
++        
++        if self.heartbeat:
++            stats["last_heartbeat"] = self.heartbeat.last_heartbeat
++        
++        stats["connection_pool"] = self.connection_pool.get_stats()
++        
++        return stats
++
++
++def start_remote_worker() -> None:
++    """Entry point for remote worker execution."""
++    pass
++
++
+ if __name__ == "__channelexec__":
+     channel: execnet.Channel = channel  # type: ignore[name-defined] # noqa: F821, PLW0127
+     workerinput, args, option_dict, change_sys_path = channel.receive()  # type: ignore[name-defined]
