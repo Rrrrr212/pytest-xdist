@@ -1,0 +1,44 @@
+diff --git a/src/xdist/looponfail.py b/src/xdist/looponfail.py
+index 7fcebe5..5259f02 100644
+--- a/src/xdist/looponfail.py
++++ b/src/xdist/looponfail.py
+@@ -70,11 +70,15 @@ def looponfail_main(config: pytest.Config) -> None:
+ 
+ 
+ class RemoteControl:
++    EXIT_TIMEOUT = 10
++
+     gateway: execnet.Gateway
++    group: execnet.Group
+ 
+     def __init__(self, config: pytest.Config) -> None:
+         self.config = config
+         self.failures: list[str] = []
++        self.group = execnet.Group(execmodel="main_thread_only")
+ 
+     def trace(self, *args: object) -> None:
+         if self.config.option.debug:
+@@ -82,7 +86,7 @@ class RemoteControl:
+             print("RemoteControl:", msg)
+ 
+     def initgateway(self) -> execnet.Gateway:
+-        return execnet.makegateway("execmodel=main_thread_only//popen")
++        return self.group.makegateway("execmodel=main_thread_only//popen")
+ 
+     def setup(self) -> None:
+         if hasattr(self, "gateway"):
+@@ -109,10 +113,12 @@ class RemoteControl:
+             if not self.channel.isclosed():
+                 self.trace("closing", self.channel)
+                 self.channel.close()
+-            del self.channel
+         if hasattr(self, "gateway"):
+             self.trace("exiting", self.gateway)
+-            self.gateway.exit()
++        self.group.terminate(self.EXIT_TIMEOUT)
++        if hasattr(self, "channel"):
++            del self.channel
++        if hasattr(self, "gateway"):
+             del self.gateway
+ 
+     def runsession(self) -> tuple[list[str], list[str], bool]:
