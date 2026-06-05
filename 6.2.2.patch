@@ -1,0 +1,575 @@
+diff --git a/src/xdist/remote.py b/src/xdist/remote.py
+index 436b5dd..e307b21 100644
+--- a/src/xdist/remote.py
++++ b/src/xdist/remote.py
+@@ -9,18 +9,27 @@ needs not to be installed in remote environments.
+ from __future__ import annotations
+ 
+ import collections
++from collections.abc import Callable
+ from collections.abc import Generator
+ from collections.abc import Iterable
+ from collections.abc import Sequence
+ import contextlib
++from dataclasses import dataclass
+ import enum
++import json
+ import os
++import queue
++import shlex
++import subprocess
+ import sys
++import tempfile
++import threading
+ import time
+ from typing import Any
+ from typing import Literal
+ from typing import TypedDict
+ from typing import Union
++import uuid
+ import warnings
+ 
+ from _pytest.config import _prepareconfig
+@@ -365,6 +374,542 @@ def serialize_warning_message(
+     return result
+ 
+ 
++@dataclass(frozen=True)
++class RemoteExecutionResult:
++    job_id: str
++    host: str
++    command: tuple[str, ...] | str
++    cwd: str | None
++    returncode: int | None
++    stdout: str
++    stderr: str
++    started_at: float
++    finished_at: float
++    duration: float
++    heartbeat_age: float
++    success: bool
++    timed_out: bool
++    metadata: dict[str, Any]
++
++
++@dataclass(frozen=True)
++class _RemoteJob:
++    job_id: str
++    command: tuple[str, ...] | str
++    cwd: str | None
++    env: dict[str, str]
++    timeout: float | None
++    metadata: dict[str, Any]
++    shell: bool
++
++
++class _SSHConnection:
++    def __init__(self, worker: RemoteWorker, index: int) -> None:
++        self.worker = worker
++        self.index = index
++        self.control_path: str | None = None
++        self._opened = False
++
++    def ensure_open(self) -> None:
++        if self._opened:
++            return
++        self.control_path = os.path.join(
++            self.worker._control_dir.name,
++            f"{self.worker._control_prefix}-{self.index}",
++        )
++        completed = subprocess.run(
++            self.worker._build_master_command(self.control_path),
++            check=False,
++            capture_output=True,
++            text=True,
++        )
++        if completed.returncode != 0:
++            message = completed.stderr.strip() or completed.stdout.strip()
++            raise OSError(message or "failed to open SSH control master")
++        self._opened = True
++
++    def close(self) -> None:
++        if not self._opened or self.control_path is None:
++            return
++        subprocess.run(
++            self.worker._build_master_exit_command(self.control_path),
++            check=False,
++            capture_output=True,
++            text=True,
++        )
++        self._opened = False
++        self.control_path = None
++
++
++class RemoteWorker:
++    HEARTBEAT_PREFIX = "__PYTEST_XDIST_REMOTE_HEARTBEAT__"
++    REMOTE_RUNNER = "\n".join(
++        (
++            "import json",
++            "import os",
++            "import subprocess",
++            "import sys",
++            "import time",
++            "payload = json.load(sys.stdin)",
++            "started_at = time.time()",
++            "started_monotonic = time.monotonic()",
++            "env = dict(os.environ)",
++            "env.update(payload['env'])",
++            "proc = subprocess.Popen(",
++            "    payload['command'],",
++            "    shell=payload['shell'],",
++            "    cwd=payload['cwd'],",
++            "    env=env,",
++            "    stdout=subprocess.PIPE,",
++            "    stderr=subprocess.PIPE,",
++            "    text=True,",
++            ")",
++            "timed_out = False",
++            "last_heartbeat = time.monotonic()",
++            "timeout = payload['timeout']",
++            "heartbeat_interval = payload['heartbeat_interval']",
++            "while proc.poll() is None:",
++            "    now = time.monotonic()",
++            "    if timeout is not None and now - started_monotonic > timeout:",
++            "        proc.kill()",
++            "        timed_out = True",
++            "        break",
++            "    if now - last_heartbeat >= heartbeat_interval:",
++            "        last_heartbeat = now",
++            "        print(payload['heartbeat_prefix'], file=sys.stderr, flush=True)",
++            "    time.sleep(min(heartbeat_interval, 0.5))",
++            "stdout, stderr = proc.communicate()",
++            "json.dump(",
++            "    {",
++            "        'returncode': proc.returncode,",
++            "        'stdout': stdout,",
++            "        'stderr': stderr,",
++            "        'finished_at': time.time(),",
++            "        'timed_out': timed_out,",
++            "    },",
++            "    sys.stdout,",
++            ")",
++        )
++    )
++
++    def __init__(
++        self,
++        host: str,
++        *,
++        user: str | None = None,
++        port: int = 22,
++        pool_size: int = 1,
++        ssh_binary: str = "ssh",
++        ssh_options: Sequence[str] = (),
++        python_executable: str = "python3",
++        connect_timeout: float = 10.0,
++        heartbeat_interval: float = 5.0,
++        heartbeat_timeout: float = 20.0,
++        control_persist: float = 60.0,
++        base_env: dict[str, str] | None = None,
++        result_handler: Callable[[RemoteExecutionResult], None] | None = None,
++        logger: Producer | None = None,
++    ) -> None:
++        if pool_size < 1:
++            raise ValueError("pool_size must be greater than zero")
++        if connect_timeout <= 0:
++            raise ValueError("connect_timeout must be greater than zero")
++        if heartbeat_interval <= 0:
++            raise ValueError("heartbeat_interval must be greater than zero")
++        if heartbeat_timeout <= heartbeat_interval:
++            raise ValueError("heartbeat_timeout must be greater than heartbeat_interval")
++        if control_persist <= 0:
++            raise ValueError("control_persist must be greater than zero")
++        self.host = host
++        self.user = user
++        self.port = port
++        self.pool_size = pool_size
++        self.ssh_binary = ssh_binary
++        self.ssh_options = tuple(ssh_options)
++        self.python_executable = python_executable
++        self.connect_timeout = connect_timeout
++        self.heartbeat_interval = heartbeat_interval
++        self.heartbeat_timeout = heartbeat_timeout
++        self.control_persist = control_persist
++        self.base_env = dict(base_env or {})
++        self.result_handler = result_handler
++        self.log = logger or Producer(f"remote-worker-{host}", enabled=False)
++        self.target = f"{user}@{host}" if user else host
++        self._control_prefix = uuid.uuid4().hex[:12]
++        self._control_dir = tempfile.TemporaryDirectory(prefix="xdist-ssh-")
++        self._job_queue: queue.Queue[_RemoteJob | None] = queue.Queue()
++        self._result_queue: queue.Queue[RemoteExecutionResult] = queue.Queue()
++        self._result_condition = threading.Condition()
++        self._connections: list[_SSHConnection] = []
++        self._threads: list[threading.Thread] = []
++        self._submitted_job_ids: list[str] = []
++        self._completed_results: dict[str, RemoteExecutionResult] = {}
++        self._closed = False
++        self._started = False
++
++    def __enter__(self) -> RemoteWorker:
++        self.start()
++        return self
++
++    def __exit__(
++        self,
++        exc_type: type[BaseException] | None,
++        exc: BaseException | None,
++        tb: Any,
++    ) -> None:
++        self.close()
++
++    def start(self) -> None:
++        with self._result_condition:
++            if self._started:
++                return
++            if self._closed:
++                raise RuntimeError("RemoteWorker is already closed")
++            for index in range(self.pool_size):
++                connection = _SSHConnection(self, index)
++                thread = threading.Thread(
++                    target=self._worker_main,
++                    args=(connection,),
++                    name=f"RemoteWorker-{self.host}-{index}",
++                    daemon=True,
++                )
++                self._connections.append(connection)
++                self._threads.append(thread)
++                thread.start()
++            self._started = True
++
++    def submit(
++        self,
++        command: Sequence[str] | str,
++        *,
++        cwd: str | None = None,
++        env: dict[str, str] | None = None,
++        timeout: float | None = None,
++        metadata: dict[str, Any] | None = None,
++    ) -> str:
++        if isinstance(command, str):
++            normalized_command: tuple[str, ...] | str = command
++            shell = True
++        else:
++            normalized_command = tuple(command)
++            shell = False
++            if not normalized_command:
++                raise ValueError("command must not be empty")
++        if timeout is not None and timeout <= 0:
++            raise ValueError("timeout must be greater than zero")
++        self.start()
++        with self._result_condition:
++            if self._closed:
++                raise RuntimeError("RemoteWorker is already closed")
++            job_id = uuid.uuid4().hex
++            self._submitted_job_ids.append(job_id)
++        job = _RemoteJob(
++            job_id=job_id,
++            command=normalized_command,
++            cwd=cwd,
++            env={**self.base_env, **(env or {})},
++            timeout=timeout,
++            metadata=dict(metadata or {}),
++            shell=shell,
++        )
++        self._job_queue.put(job)
++        return job_id
++
++    def get_result(self, timeout: float | None = None) -> RemoteExecutionResult:
++        return self._result_queue.get(timeout=timeout)
++
++    def wait_for(self, job_id: str, timeout: float | None = None) -> RemoteExecutionResult:
++        deadline = None if timeout is None else time.monotonic() + timeout
++        with self._result_condition:
++            while job_id not in self._completed_results:
++                if deadline is None:
++                    self._result_condition.wait()
++                    continue
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError(f"timeout waiting for job {job_id}")
++                self._result_condition.wait(remaining)
++            return self._completed_results[job_id]
++
++    def wait_for_all(self, timeout: float | None = None) -> list[RemoteExecutionResult]:
++        deadline = None if timeout is None else time.monotonic() + timeout
++        with self._result_condition:
++            expected = tuple(self._submitted_job_ids)
++            while len(self._completed_results) < len(expected):
++                if deadline is None:
++                    self._result_condition.wait()
++                    continue
++                remaining = deadline - time.monotonic()
++                if remaining <= 0:
++                    raise TimeoutError("timeout waiting for remote jobs")
++                self._result_condition.wait(remaining)
++            return [self._completed_results[job_id] for job_id in expected]
++
++    def run(
++        self,
++        command: Sequence[str] | str,
++        *,
++        cwd: str | None = None,
++        env: dict[str, str] | None = None,
++        timeout: float | None = None,
++        metadata: dict[str, Any] | None = None,
++    ) -> RemoteExecutionResult:
++        job_id = self.submit(
++            command,
++            cwd=cwd,
++            env=env,
++            timeout=timeout,
++            metadata=metadata,
++        )
++        return self.wait_for(job_id, timeout=timeout)
++
++    def close(self, *, wait: bool = True) -> None:
++        with self._result_condition:
++            if self._closed:
++                return
++            self._closed = True
++        if wait:
++            self.wait_for_all()
++        for _thread in self._threads:
++            self._job_queue.put(None)
++        for thread in self._threads:
++            thread.join()
++        for connection in self._connections:
++            connection.close()
++        self._control_dir.cleanup()
++
++    def _worker_main(self, connection: _SSHConnection) -> None:
++        while True:
++            job = self._job_queue.get()
++            try:
++                if job is None:
++                    return
++                result = self._execute_job(connection, job)
++                self._publish_result(result)
++            finally:
++                self._job_queue.task_done()
++
++    def _execute_job(
++        self,
++        connection: _SSHConnection,
++        job: _RemoteJob,
++    ) -> RemoteExecutionResult:
++        started_at = time.time()
++        last_heartbeat = time.monotonic()
++        heartbeat_age = 0.0
++        heartbeat_failed = False
++        try:
++            connection.ensure_open()
++            process = subprocess.Popen(
++                self._build_exec_command(connection.control_path),
++                stdin=subprocess.PIPE,
++                stdout=subprocess.PIPE,
++                stderr=subprocess.PIPE,
++                text=True,
++            )
++        except OSError as exc:
++            finished_at = time.time()
++            return RemoteExecutionResult(
++                job_id=job.job_id,
++                host=self.host,
++                command=job.command,
++                cwd=job.cwd,
++                returncode=None,
++                stdout="",
++                stderr=str(exc),
++                started_at=started_at,
++                finished_at=finished_at,
++                duration=finished_at - started_at,
++                heartbeat_age=heartbeat_age,
++                success=False,
++                timed_out=False,
++                metadata=job.metadata,
++            )
++
++        stdout_buffer: list[str] = []
++        stderr_buffer: list[str] = []
++        heartbeat_lock = threading.Lock()
++
++        def read_stdout() -> None:
++            assert process.stdout is not None
++            stdout_buffer.append(process.stdout.read())
++
++        def read_stderr() -> None:
++            nonlocal last_heartbeat
++            assert process.stderr is not None
++            for line in process.stderr:
++                if line.startswith(self.HEARTBEAT_PREFIX):
++                    with heartbeat_lock:
++                        last_heartbeat = time.monotonic()
++                    continue
++                stderr_buffer.append(line)
++
++        stdout_thread = threading.Thread(target=read_stdout, daemon=True)
++        stderr_thread = threading.Thread(target=read_stderr, daemon=True)
++        stdout_thread.start()
++        stderr_thread.start()
++
++        try:
++            if process.stdin is not None:
++                payload = self._build_payload(job)
++                process.stdin.write(json.dumps(payload))
++                process.stdin.close()
++        except OSError as exc:
++            stderr_buffer.append(str(exc))
++
++        while process.poll() is None:
++            with heartbeat_lock:
++                heartbeat_age = time.monotonic() - last_heartbeat
++            if heartbeat_age > self.heartbeat_timeout:
++                heartbeat_failed = True
++                process.kill()
++                break
++            time.sleep(min(self.heartbeat_interval / 2, 0.5))
++
++        process.wait()
++        stdout_thread.join()
++        stderr_thread.join()
++        finished_at = time.time()
++        with heartbeat_lock:
++            heartbeat_age = time.monotonic() - last_heartbeat
++
++        payload_data: dict[str, Any] | None = None
++        payload_text = "".join(stdout_buffer).strip()
++        if payload_text:
++            try:
++                payload_data = json.loads(payload_text)
++            except json.JSONDecodeError:
++                payload_data = None
++
++        if payload_data is None:
++            stderr = "".join(stderr_buffer)
++            if heartbeat_failed:
++                if stderr:
++                    stderr = f"{stderr}\nheartbeat timed out"
++                else:
++                    stderr = "heartbeat timed out"
++            return RemoteExecutionResult(
++                job_id=job.job_id,
++                host=self.host,
++                command=job.command,
++                cwd=job.cwd,
++                returncode=process.returncode,
++                stdout=payload_text,
++                stderr=stderr,
++                started_at=started_at,
++                finished_at=finished_at,
++                duration=finished_at - started_at,
++                heartbeat_age=heartbeat_age,
++                success=False,
++                timed_out=heartbeat_failed,
++                metadata=job.metadata,
++            )
++
++        stderr = payload_data.get("stderr", "")
++        extra_stderr = "".join(stderr_buffer)
++        if extra_stderr:
++            stderr = f"{stderr}{extra_stderr}" if stderr else extra_stderr
++        if heartbeat_failed:
++            stderr = f"{stderr}\nheartbeat timed out" if stderr else "heartbeat timed out"
++        timed_out = bool(payload_data.get("timed_out", False) or heartbeat_failed)
++        returncode = payload_data.get("returncode")
++        return RemoteExecutionResult(
++            job_id=job.job_id,
++            host=self.host,
++            command=job.command,
++            cwd=job.cwd,
++            returncode=returncode,
++            stdout=payload_data.get("stdout", ""),
++            stderr=stderr,
++            started_at=started_at,
++            finished_at=float(payload_data.get("finished_at", finished_at)),
++            duration=finished_at - started_at,
++            heartbeat_age=heartbeat_age,
++            success=bool(returncode == 0 and not timed_out),
++            timed_out=timed_out,
++            metadata=job.metadata,
++        )
++
++    def _publish_result(self, result: RemoteExecutionResult) -> None:
++        self._result_queue.put(result)
++        with self._result_condition:
++            self._completed_results[result.job_id] = result
++            self._result_condition.notify_all()
++        if self.result_handler is not None:
++            try:
++                self.result_handler(result)
++            except Exception as exc:
++                self.log("result handler failed", result.job_id, exc)
++
++    def _build_payload(self, job: _RemoteJob) -> dict[str, Any]:
++        return {
++            "command": job.command if isinstance(job.command, str) else list(job.command),
++            "cwd": job.cwd,
++            "env": job.env,
++            "timeout": job.timeout,
++            "shell": job.shell,
++            "heartbeat_interval": self.heartbeat_interval,
++            "heartbeat_prefix": self.HEARTBEAT_PREFIX,
++        }
++
++    def _build_master_command(self, control_path: str) -> list[str]:
++        return [
++            *self._build_base_ssh_command(),
++            "-o",
++            "ControlMaster=yes",
++            "-o",
++            f"ControlPath={control_path}",
++            "-o",
++            f"ControlPersist={int(self.control_persist)}",
++            "-Nf",
++            self.target,
++        ]
++
++    def _build_master_exit_command(self, control_path: str) -> list[str]:
++        return [
++            *self._build_base_ssh_command(),
++            "-S",
++            control_path,
++            "-O",
++            "exit",
++            self.target,
++        ]
++
++    def _build_exec_command(self, control_path: str | None) -> list[str]:
++        command = [*self._build_base_ssh_command()]
++        if control_path is not None:
++            command.extend(["-S", control_path])
++        remote_command = " ".join(
++            shlex.quote(part)
++            for part in (self.python_executable, "-c", self.REMOTE_RUNNER)
++        )
++        command.extend([self.target, remote_command])
++        return command
++
++    def _build_base_ssh_command(self) -> list[str]:
++        command = [self.ssh_binary]
++        if self.port != 22:
++            command.extend(["-p", str(self.port)])
++        command.extend(
++            [
++                "-o",
++                "BatchMode=yes",
++                "-o",
++                f"ConnectTimeout={int(self.connect_timeout)}",
++                "-o",
++                f"ServerAliveInterval={max(1, int(self.heartbeat_interval))}",
++                "-o",
++                f"ServerAliveCountMax={self._server_alive_count_max()}",
++            ]
++        )
++        command.extend(self.ssh_options)
++        return command
++
++    def _server_alive_count_max(self) -> int:
++        ratio = self.heartbeat_timeout / self.heartbeat_interval
++        return max(1, int(ratio) + 1)
++
++
+ class WorkerInfo(TypedDict):
+     version: str
+     version_info: tuple[int, int, int, str, int]
