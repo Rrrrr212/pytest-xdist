@@ -1,0 +1,370 @@
+diff --git a/src/xdist/remote.py b/src/xdist/remote.py
+index 436b5dd..a951ecd 100644
+--- a/src/xdist/remote.py
++++ b/src/xdist/remote.py
+@@ -17,8 +17,11 @@ import enum
+ import os
+ import sys
+ import time
++import threading
+ from typing import Any
++from typing import Callable
+ from typing import Literal
++from typing import Optional
+ from typing import TypedDict
+ from typing import Union
+ import warnings
+@@ -425,3 +428,353 @@ if __name__ == "__channelexec__":
+     config.workeroutput = {}  # type: ignore[attr-defined]
+     interactor = WorkerInteractor(config, channel)  # type: ignore[name-defined]
+     config.hook.pytest_cmdline_main(config=config)
++
++
++class RemoteWorkerStatus(enum.Enum):
++    """Remote worker status enum."""
++    IDLE = "idle"
++    BUSY = "busy"
++    DISCONNECTED = "disconnected"
++    ERROR = "error"
++
++
++class RemoteWorker:
++    """Remote worker that executes tests on a remote machine via SSH.
++    
++    This class provides SSH connectivity, connection pooling, heartbeat detection,
++    and result transmission for distributed pytest execution.
++    """
++
++    DEFAULT_HEARTBEAT_INTERVAL = 30.0
++    DEFAULT_CONNECTION_TIMEOUT = 60.0
++    DEFAULT_POOL_SIZE = 5
++
++    def __init__(
++        self,
++        worker_id: str,
++        ssh_host: str,
++        ssh_port: int = 22,
++        ssh_username: Optional[str] = None,
++        ssh_key_path: Optional[str] = None,
++        remote_dir: str = "pytest-xdist-remote",
++        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
++        connection_timeout: float = DEFAULT_CONNECTION_TIMEOUT,
++        result_callback: Optional[Callable[[str, Any], None]] = None,
++    ) -> None:
++        """Initialize the RemoteWorker.
++        
++        Args:
++            worker_id: Unique identifier for this worker
++            ssh_host: SSH hostname or IP address
++            ssh_port: SSH port number
++            ssh_username: SSH username (defaults to current user)
++            ssh_key_path: Path to SSH private key (optional)
++            remote_dir: Directory on remote machine to execute tests
++            heartbeat_interval: Interval in seconds for heartbeat checks
++            connection_timeout: Connection timeout in seconds
++            result_callback: Callback function for receiving results
++        """
++        self.worker_id = worker_id
++        self.ssh_host = ssh_host
++        self.ssh_port = ssh_port
++        self.ssh_username = ssh_username
++        self.ssh_key_path = ssh_key_path
++        self.remote_dir = remote_dir
++        self.heartbeat_interval = heartbeat_interval
++        self.connection_timeout = connection_timeout
++        self.result_callback = result_callback
++        
++        self._gateway: Optional[execnet.Gateway] = None
++        self._channel: Optional[execnet.Channel] = None
++        self._status = RemoteWorkerStatus.DISCONNECTED
++        self._heartbeat_thread: Optional[threading.Thread] = None
++        self._heartbeat_stop_event = threading.Event()
++        self._lock = threading.Lock()
++        self._last_heartbeat: Optional[float] = None
++        self._result_queue: list[tuple[str, Any]] = []
++
++    def _build_ssh_spec(self) -> str:
++        """Build the execnet SSH specification string.
++        
++        Returns:
++            SSH specification string for execnet
++        """
++        spec_parts = ["ssh"]
++        if self.ssh_username:
++            spec_parts.append(f"//user={self.ssh_username}")
++        spec_parts.append(f"//host={self.ssh_host}")
++        spec_parts.append(f"//port={self.ssh_port}")
++        if self.ssh_key_path:
++            spec_parts.append(f"//ssh-identity={self.ssh_key_path}")
++        if self.remote_dir:
++            spec_parts.append(f"//chdir={self.remote_dir}")
++        return "".join(spec_parts)
++
++    def connect(self) -> bool:
++        """Establish SSH connection to remote machine.
++        
++        Returns:
++            True if connection successful, False otherwise
++        """
++        with self._lock:
++            try:
++                self.log(f"Connecting to {self.ssh_host}:{self.ssh_port}")
++                ssh_spec = self._build_ssh_spec()
++                self._gateway = execnet.makegateway(ssh_spec)
++                self._status = RemoteWorkerStatus.IDLE
++                self._last_heartbeat = time.time()
++                self._start_heartbeat()
++                self.log(f"Successfully connected to {self.ssh_host}")
++                return True
++            except Exception as e:
++                self.log(f"Connection failed: {e}")
++                self._status = RemoteWorkerStatus.ERROR
++                return False
++
++    def disconnect(self) -> None:
++        """Disconnect from remote machine and clean up resources."""
++        with self._lock:
++            self._stop_heartbeat()
++            if self._channel and not self._channel.isclosed():
++                self._channel.close()
++                self._channel = None
++            if self._gateway:
++                try:
++                    self._gateway.exit()
++                except Exception as e:
++                    self.log(f"Error closing gateway: {e}")
++                self._gateway = None
++            self._status = RemoteWorkerStatus.DISCONNECTED
++            self.log(f"Disconnected from {self.ssh_host}")
++
++    def _start_heartbeat(self) -> None:
++        """Start heartbeat monitoring thread."""
++        self._heartbeat_stop_event.clear()
++        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
++        self._heartbeat_thread.start()
++
++    def _stop_heartbeat(self) -> None:
++        """Stop heartbeat monitoring thread."""
++        self._heartbeat_stop_event.set()
++        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
++            self._heartbeat_thread.join(timeout=5.0)
++
++    def _heartbeat_loop(self) -> None:
++        """Heartbeat loop to check remote worker status."""
++        while not self._heartbeat_stop_event.is_set():
++            try:
++                if self._gateway and self._gateway._rinfo():
++                    self._last_heartbeat = time.time()
++                else:
++                    self._status = RemoteWorkerStatus.ERROR
++                    self.log("Heartbeat failed: gateway not responsive")
++            except Exception as e:
++                self.log(f"Heartbeat error: {e}")
++                self._status = RemoteWorkerStatus.ERROR
++            self._heartbeat_stop_event.wait(self.heartbeat_interval)
++
++    def is_connected(self) -> bool:
++        """Check if worker is connected.
++        
++        Returns:
++            True if connected, False otherwise
++        """
++        return (
++            self._status != RemoteWorkerStatus.DISCONNECTED
++            and self._status != RemoteWorkerStatus.ERROR
++        )
++
++    def get_status(self) -> RemoteWorkerStatus:
++        """Get current worker status.
++        
++        Returns:
++            Current RemoteWorkerStatus
++        """
++        return self._status
++
++    def setup_remote_session(self, worker_input: dict[str, Any]) -> bool:
++        """Set up remote test session.
++        
++        Args:
++            worker_input: Worker input configuration
++            
++        Returns:
++            True if setup successful, False otherwise
++        """
++        with self._lock:
++            if not self.is_connected():
++                self.log("Cannot setup session: not connected")
++                return False
++            
++            try:
++                self.log("Setting up remote session")
++                self._channel = self._gateway.remote_exec(sys.modules[__name__])
++                self._channel.send(worker_input)
++                self._channel.setcallback(self._handle_remote_event)
++                self._status = RemoteWorkerStatus.IDLE
++                return True
++            except Exception as e:
++                self.log(f"Session setup failed: {e}")
++                self._status = RemoteWorkerStatus.ERROR
++                return False
++
++    def send_command(self, command: str, **kwargs: Any) -> None:
++        """Send command to remote worker.
++        
++        Args:
++            command: Command name
++            **kwargs: Command arguments
++        """
++        with self._lock:
++            if not self._channel or self._channel.isclosed():
++                self.log("Cannot send command: channel not available")
++                return
++            
++            try:
++                self._channel.send((command, kwargs))
++                self._status = RemoteWorkerStatus.BUSY
++            except Exception as e:
++                self.log(f"Failed to send command: {e}")
++                self._status = RemoteWorkerStatus.ERROR
++
++    def _handle_remote_event(self, event: tuple[str, dict[str, Any]] | Literal[Marker.SHUTDOWN]) -> None:
++        """Handle events received from remote worker.
++        
++        Args:
++            event: Event tuple or shutdown marker
++        """
++        if event is Marker.SHUTDOWN:
++            self._status = RemoteWorkerStatus.IDLE
++            self.log("Received shutdown from remote")
++            return
++        
++        event_name, event_data = event
++        self.log(f"Received event: {event_name}")
++        
++        self._result_queue.append((event_name, event_data))
++        if self.result_callback:
++            self.result_callback(event_name, event_data)
++        
++        if event_name == "workerfinished":
++            self._status = RemoteWorkerStatus.IDLE
++
++    def get_results(self) -> list[tuple[str, Any]]:
++        """Get accumulated results.
++        
++        Returns:
++            List of (event_name, event_data) tuples
++        """
++        with self._lock:
++            results = list(self._result_queue)
++            self._result_queue.clear()
++            return results
++
++    def log(self, message: str) -> None:
++        """Log a message with worker identifier.
++        
++        Args:
++            message: Message to log
++        """
++        print(f"[RemoteWorker:{self.worker_id}] {message}")
++
++    def __repr__(self) -> str:
++        return f"<RemoteWorker {self.worker_id}@{self.ssh_host} status={self._status.value}>"
++
++
++class RemoteWorkerPool:
++    """Pool of RemoteWorker instances for managing multiple remote workers."""
++
++    def __init__(
++        self,
++        pool_size: int = RemoteWorker.DEFAULT_POOL_SIZE,
++    ) -> None:
++        """Initialize the worker pool.
++        
++        Args:
++            pool_size: Maximum number of workers in the pool
++        """
++        self.pool_size = pool_size
++        self._workers: dict[str, RemoteWorker] = {}
++        self._lock = threading.Lock()
++
++    def add_worker(self, worker: RemoteWorker) -> None:
++        """Add a worker to the pool.
++        
++        Args:
++            worker: RemoteWorker instance to add
++        """
++        with self._lock:
++            if len(self._workers) >= self.pool_size:
++                raise RuntimeError(f"Pool full (max {self.pool_size} workers)")
++            self._workers[worker.worker_id] = worker
++
++    def remove_worker(self, worker_id: str) -> Optional[RemoteWorker]:
++        """Remove a worker from the pool.
++        
++        Args:
++            worker_id: ID of worker to remove
++            
++        Returns:
++            Removed RemoteWorker instance or None
++        """
++        with self._lock:
++            return self._workers.pop(worker_id, None)
++
++    def get_worker(self, worker_id: str) -> Optional[RemoteWorker]:
++        """Get a worker from the pool by ID.
++        
++        Args:
++            worker_id: ID of worker to get
++            
++        Returns:
++            RemoteWorker instance or None
++        """
++        with self._lock:
++            return self._workers.get(worker_id)
++
++    def get_idle_worker(self) -> Optional[RemoteWorker]:
++        """Get an idle worker from the pool.
++        
++        Returns:
++            Idle RemoteWorker instance or None
++        """
++        with self._lock:
++            for worker in self._workers.values():
++                if worker.get_status() == RemoteWorkerStatus.IDLE:
++                    return worker
++            return None
++
++    def get_all_workers(self) -> list[RemoteWorker]:
++        """Get all workers in the pool.
++        
++        Returns:
++            List of all RemoteWorker instances
++        """
++        with self._lock:
++            return list(self._workers.values())
++
++    def connect_all(self) -> dict[str, bool]:
++        """Connect all workers in the pool.
++        
++        Returns:
++            Dictionary mapping worker IDs to connection success status
++        """
++        results = {}
++        with self._lock:
++            for worker_id, worker in self._workers.items():
++                results[worker_id] = worker.connect()
++        return results
++
++    def disconnect_all(self) -> None:
++        """Disconnect all workers in the pool."""
++        with self._lock:
++            for worker in self._workers.values():
++                worker.disconnect()
++
++    def __len__(self) -> int:
++        with self._lock:
++            return len(self._workers)
++
++    def __contains__(self, worker_id: str) -> bool:
++        with self._lock:
++            return worker_id in self._workers
