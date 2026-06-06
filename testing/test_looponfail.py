@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import pathlib
 from pathlib import Path
 import shutil
 import tempfile
 import textwrap
+import time
 import unittest.mock
 
 import pytest
@@ -73,8 +75,6 @@ class TestStatRecorder:
         assert changed
 
         p.unlink()
-        # make check()'s visit() call return our just removed
-        # path as if we were in a race condition
         dirname = str(tmp)
         dirnames: list[str] = []
         filenames = [str(p)]
@@ -187,12 +187,6 @@ class TestRemoteControl:
     def test_ignore_sys_path_hook_entry(
         self, pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Modifying sys.path as seen by the worker process is a bit tricky,
-        # because any changes made in the current process do not carry over.
-        # However, we can leverage the `sitecustomize` behavior to run arbitrary
-        # code when the subprocess interpreter is starting up. We just need to
-        # install our module in the search path, which we can accomplish by
-        # adding a temporary directory to PYTHONPATH.
         tmpdir = tempfile.TemporaryDirectory()
         with open(pathlib.Path(tmpdir.name) / "sitecustomize.py", "w") as custom:
             print(
@@ -333,7 +327,6 @@ class TestLooponFailing:
         orig_runsession = remotecontrol.runsession
 
         def runsession_dups() -> tuple[list[str], list[str], bool]:
-            # twisted.trial test cases may report multiple errors.
             failures, reports, collection_failed = orig_runsession()
             print(failures)
             return failures * 2, reports, collection_failed
@@ -354,8 +347,6 @@ class TestFunctional:
                 """
             )
         )
-        # p = pytester.mkdir("sub").join(p1.basename)
-        # p1.move(p)
         child = pytester.spawn_pytest("-f %s --traceconfig" % p, expect_timeout=30.0)
         child.expect("def test_one")
         child.expect("x == 1")
@@ -387,13 +378,68 @@ class TestFunctional:
         )
         child = pytester.spawn_pytest("-f %s" % p, expect_timeout=30.0)
         child.expect("1 xpass")
-        # child.expect("### LOOPONFAILING ####")
         child.expect("waiting for changes")
         child.kill(15)
 
+    def test_restarts_reap_old_workers(self, pytester: pytest.Pytester) -> None:
+        pidfile = pytester.path / "worker-pids.txt"
+        p = pytester.makepyfile(
+            textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+
+                with Path({str(pidfile)!r}).open("a") as stream:
+                    print(os.getpid(), file=stream)
+
+                def test_one():
+                    assert 0
+                """
+            )
+        )
+        child = pytester.spawn_pytest("-f %s" % p, expect_timeout=30.0)
+        child.expect("1 failed")
+        child.expect("waiting for changes")
+        assert len(read_pids(pidfile)) == 1
+
+        p.write_text(
+            textwrap.dedent(
+                f"""
+                import os
+                from pathlib import Path
+
+                with Path({str(pidfile)!r}).open("a") as stream:
+                    print(os.getpid(), file=stream)
+
+                def test_one():
+                    assert 1
+                """
+            )
+        )
+        child.expect(".*1 passed.*")
+        child.expect("waiting for changes")
+        pids = read_pids(pidfile)
+        assert len(set(pids)) >= 2
+        assert all(wait_for_pid_exit(pid) for pid in pids)
+        child.kill(15)
+
+
+def read_pids(path: Path) -> list[int]:
+    return [int(line) for line in path.read_text().splitlines() if line]
+
+
+def wait_for_pid_exit(pid: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    return False
+
 
 def removepyc(path: Path) -> None:
-    # XXX damn those pyc files
     pyc = path.with_suffix(".pyc")
     if pyc.exists():
         pyc.unlink()

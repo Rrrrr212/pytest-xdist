@@ -70,11 +70,13 @@ def looponfail_main(config: pytest.Config) -> None:
 
 
 class RemoteControl:
+    EXIT_TIMEOUT = 1.0
     gateway: execnet.Gateway
 
     def __init__(self, config: pytest.Config) -> None:
         self.config = config
         self.failures: list[str] = []
+        self.group = execnet.Group(execmodel="main_thread_only")
 
     def trace(self, *args: object) -> None:
         if self.config.option.debug:
@@ -82,7 +84,7 @@ class RemoteControl:
             print("RemoteControl:", msg)
 
     def initgateway(self) -> execnet.Gateway:
-        return execnet.makegateway("execmodel=main_thread_only//popen")
+        return self.group.makegateway("popen")
 
     def setup(self) -> None:
         if hasattr(self, "gateway"):
@@ -94,7 +96,7 @@ class RemoteControl:
             args=self.config.args,
             option_dict=vars(self.config.option),
         )
-        remote_outchannel: execnet.Channel = channel.receive()
+        self.remote_outchannel = channel.receive()
 
         out = TerminalWriter()
 
@@ -102,7 +104,7 @@ class RemoteControl:
             out._file.write(s)
             out._file.flush()
 
-        remote_outchannel.setcallback(write)
+        self.remote_outchannel.setcallback(write)
 
     def ensure_teardown(self) -> None:
         if hasattr(self, "channel"):
@@ -110,9 +112,14 @@ class RemoteControl:
                 self.trace("closing", self.channel)
                 self.channel.close()
             del self.channel
+        if hasattr(self, "remote_outchannel"):
+            if not self.remote_outchannel.isclosed():
+                self.trace("closing", self.remote_outchannel)
+                self.remote_outchannel.close()
+            del self.remote_outchannel
         if hasattr(self, "gateway"):
-            self.trace("exiting", self.gateway)
-            self.gateway.exit()
+            self.trace("terminating", self.gateway)
+            self.group.terminate(self.EXIT_TIMEOUT)
             del self.gateway
 
     def runsession(self) -> tuple[list[str], list[str], bool]:
@@ -165,6 +172,8 @@ def init_worker_session(
     import os
     import sys
 
+    stdout = sys.stdout
+    stderr = sys.stderr
     outchannel = channel.gateway.newchannel()
     sys.stdout = sys.stderr = outchannel.makefile("w")
     channel.send(outchannel)
@@ -185,7 +194,12 @@ def init_worker_session(
     config.args = args
     from xdist.looponfail import WorkerFailSession
 
-    WorkerFailSession(config, channel).main()
+    try:
+        WorkerFailSession(config, channel).main()
+    finally:
+        sys.stdout = stdout
+        sys.stderr = stderr
+        outchannel.close()
 
 
 class WorkerFailSession:
@@ -245,6 +259,7 @@ class WorkerFailSession:
             failreports.append(loc)
         result = (trails, failreports, self.collection_failed)
         self.channel.send(result)
+        self.channel.waitclose()
 
 
 class StatRecorder:
