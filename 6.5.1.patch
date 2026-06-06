@@ -1,0 +1,59 @@
+diff --git a/src/xdist/dsession.py b/src/xdist/dsession.py
+index 47e1de7..3e6b637 100644
+--- a/src/xdist/dsession.py
++++ b/src/xdist/dsession.py
+@@ -20,6 +20,7 @@ from xdist.scheduler import LoadGroupScheduling
+ from xdist.scheduler import LoadScheduling
+ from xdist.scheduler import LoadScopeScheduling
+ from xdist.scheduler import Scheduling
++from xdist.scheduler import SmartLoadGroupScheduling
+ from xdist.scheduler import WorkStealingScheduling
+ from xdist.workermanage import NodeManager
+ from xdist.workermanage import WorkerController
+@@ -111,6 +112,9 @@ class DSession:
+         log: Producer,
+     ) -> Scheduling | None:
+         dist = config.getvalue("dist")
++        # 如果设置了 --load-group 参数，优先使用智能调度器
++        if config.option.loadgroup is not None:
++            return SmartLoadGroupScheduling(config, log)
+         if dist == "each":
+             return EachScheduling(config, log)
+         if dist == "load":
+diff --git a/src/xdist/plugin.py b/src/xdist/plugin.py
+index d8553ce..c83dd46 100644
+--- a/src/xdist/plugin.py
++++ b/src/xdist/plugin.py
+@@ -303,6 +303,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "Unlimited if not set."
+         ),
+     )
++    group.addoption(
++        "--load-group",
++        action="store",
++        choices=["size", "time"],
++        dest="loadgroup",
++        default=None,
++        help=(
++            "Set grouping strategy for test load balancing.\n\n"
++            "size: Group tests by file size to balance workload.\n\n"
++            "time: Group tests by historical execution time to balance workload.\n\n"
++            "Only works with --dist=loadfile or custom smart load balancing."
++        ),
++    )
+ 
+     parser.addini(
+         "rsyncdirs",
+diff --git a/src/xdist/scheduler/__init__.py b/src/xdist/scheduler/__init__.py
+index b489473..aa443eb 100644
+--- a/src/xdist/scheduler/__init__.py
++++ b/src/xdist/scheduler/__init__.py
+@@ -4,4 +4,8 @@ from xdist.scheduler.loadfile import LoadFileScheduling as LoadFileScheduling
+ from xdist.scheduler.loadgroup import LoadGroupScheduling as LoadGroupScheduling
+ from xdist.scheduler.loadscope import LoadScopeScheduling as LoadScopeScheduling
+ from xdist.scheduler.protocol import Scheduling as Scheduling
++from xdist.scheduler.smartloadgroup import SmartLoadGroupScheduling as SmartLoadGroupScheduling
++from xdist.scheduler.smartloadgroup import get_test_file_size as get_test_file_size
++from xdist.scheduler.smartloadgroup import get_historical_execution_time as get_historical_execution_time
++from xdist.scheduler.smartloadgroup import save_execution_time as save_execution_time
+ from xdist.scheduler.worksteal import WorkStealingScheduling as WorkStealingScheduling

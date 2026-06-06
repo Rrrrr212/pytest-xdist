@@ -20,6 +20,7 @@ from xdist.scheduler import LoadGroupScheduling
 from xdist.scheduler import LoadScheduling
 from xdist.scheduler import LoadScopeScheduling
 from xdist.scheduler import Scheduling
+from xdist.scheduler import SmartLoadGroupScheduling
 from xdist.scheduler import WorkStealingScheduling
 from xdist.workermanage import NodeManager
 from xdist.workermanage import WorkerController
@@ -111,6 +112,9 @@ class DSession:
         log: Producer,
     ) -> Scheduling | None:
         dist = config.getvalue("dist")
+        # 如果设置了 --load-group 参数，优先使用智能调度器
+        if config.option.loadgroup is not None:
+            return SmartLoadGroupScheduling(config, log)
         if dist == "each":
             return EachScheduling(config, log)
         if dist == "load":
