@@ -1,0 +1,355 @@
+diff --git a/src/xdist/workermanage.py b/src/xdist/workermanage.py
+index 201c8e7..e5def9e 100644
+--- a/src/xdist/workermanage.py
++++ b/src/xdist/workermanage.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from abc import ABC, abstractmethod
+ from collections.abc import Sequence
+ import enum
+ import fnmatch
+@@ -41,6 +42,130 @@ def parse_tx_spec_config(config: pytest.Config) -> list[str]:
+     return xspeclist
+ 
+ 
++class WorkerType(enum.Enum):
++    """Worker 类型枚举"""
++    PROCESS = "process"
++    THREAD = "thread"
++    REMOTE = "remote"
++
++
++class Worker(ABC):
++    """Worker 基类，定义 Worker 的通用接口"""
++
++    @abstractmethod
++    def setup(self) -> None:
++        """设置 Worker"""
++        pass
++
++    @abstractmethod
++    def shutdown(self) -> None:
++        """关闭 Worker"""
++        pass
++
++    @abstractmethod
++    def ensure_teardown(self) -> None:
++        """确保 Worker 被关闭"""
++        pass
++
++    @abstractmethod
++    def sendcommand(self, name: str, **kwargs: object) -> None:
++        """发送命令给 Worker"""
++        pass
++
++
++class WorkerFactory(ABC):
++    """Worker 工厂基类，定义创建 Worker 的接口"""
++
++    @abstractmethod
++    def create_worker(
++        self,
++        nodemanager: NodeManager,
++        gateway: execnet.Gateway,
++        config: pytest.Config,
++        putevent: Callable[[tuple[str, dict[str, Any]]], None],
++    ) -> WorkerController:
++        """创建 Worker 实例"""
++        pass
++
++    @abstractmethod
++    def supports_spec(self, spec: execnet.XSpec) -> bool:
++        """判断该工厂是否支持指定的 spec"""
++        pass
++
++
++class ProcessWorkerFactory(WorkerFactory):
++    """进程 Worker 工厂"""
++
++    def create_worker(
++        self,
++        nodemanager: NodeManager,
++        gateway: execnet.Gateway,
++        config: pytest.Config,
++        putevent: Callable[[tuple[str, dict[str, Any]]], None],
++    ) -> WorkerController:
++        return WorkerController(nodemanager, gateway, config, putevent)
++
++    def supports_spec(self, spec: execnet.XSpec) -> bool:
++        return spec.popen is not None
++
++
++class ThreadWorkerFactory(WorkerFactory):
++    """线程 Worker 工厂"""
++
++    def create_worker(
++        self,
++        nodemanager: NodeManager,
++        gateway: execnet.Gateway,
++        config: pytest.Config,
++        putevent: Callable[[tuple[str, dict[str, Any]]], None],
++    ) -> WorkerController:
++        return WorkerController(nodemanager, gateway, config, putevent)
++
++    def supports_spec(self, spec: execnet.XSpec) -> bool:
++        return spec.popen is None and spec.chdir is None
++
++
++class RemoteWorkerFactory(WorkerFactory):
++    """远程 Worker 工厂"""
++
++    def create_worker(
++        self,
++        nodemanager: NodeManager,
++        gateway: execnet.Gateway,
++        config: pytest.Config,
++        putevent: Callable[[tuple[str, dict[str, Any]]], None],
++    ) -> WorkerController:
++        return WorkerController(nodemanager, gateway, config, putevent)
++
++    def supports_spec(self, spec: execnet.XSpec) -> bool:
++        return spec.popen is None and spec.chdir is not None
++
++
++class WorkerFactoryRegistry:
++    """Worker 工厂注册表，管理所有可用的 Worker 工厂"""
++
++    def __init__(self) -> None:
++        self._factories: list[WorkerFactory] = []
++        self._register_default_factories()
++
++    def _register_default_factories(self) -> None:
++        """注册默认的 Worker 工厂"""
++        self.register_factory(ProcessWorkerFactory())
++        self.register_factory(ThreadWorkerFactory())
++        self.register_factory(RemoteWorkerFactory())
++
++    def register_factory(self, factory: WorkerFactory) -> None:
++        """注册新的 Worker 工厂"""
++        self._factories.append(factory)
++
++    def get_factory(self, spec: execnet.XSpec) -> WorkerFactory:
++        """获取支持指定 spec 的 Worker 工厂"""
++        for factory in reversed(self._factories):
++            if factory.supports_spec(spec):
++                return factory
++        raise ValueError(f"No factory found for spec: {spec}")
++
++
+ class NodeManager:
+     EXIT_TIMEOUT = 10
+     DEFAULT_IGNORES = [".*", "*.pyc", "*.pyo", "*~"]
+@@ -50,6 +175,7 @@ class NodeManager:
+         config: pytest.Config,
+         specs: Sequence[execnet.XSpec | str] | None = None,
+         defaultchdir: str = "pyexecnetcache",
++        factory_registry: WorkerFactoryRegistry | None = None,
+     ) -> None:
+         self.config = config
+         self.trace = self.config.trace.get("nodemanager")
+@@ -57,10 +183,8 @@ class NodeManager:
+         if self.testrunuid is None:
+             self.testrunuid = uuid.uuid4().hex
+         self.group = execnet.Group(execmodel="main_thread_only")
++        self.factory_registry = factory_registry or WorkerFactoryRegistry()
+         for proxy_spec in self._getpxspecs():
+-            # Proxy gateways do not run workers, and are meant to be passed with the `via` attribute
+-            # to additional gateways.
+-            # They are useful for running multiple workers on remote machines.
+             if getattr(proxy_spec, "id", None) is None:
+                 raise pytest.UsageError(
+                     f"Proxy gateway {proxy_spec} must include an id"
+@@ -83,7 +207,6 @@ class NodeManager:
+         self._rsynced_specs: set[tuple[Any, Any]] = set()
+ 
+     def rsync_roots(self, gateway: execnet.Gateway) -> None:
+-        """Rsync the set of roots to the node's gateway cwd."""
+         if self.roots:
+             for root in self.roots:
+                 self.rsync(gateway, root, **self.rsyncoptions)
+@@ -103,12 +226,14 @@ class NodeManager:
+     ) -> WorkerController:
+         if getattr(spec, "execmodel", None) != "main_thread_only":
+             spec = execnet.XSpec(f"execmodel=main_thread_only//{spec}")
+-        gw = self.group.makegateway(spec)
+-        self.config.hook.pytest_xdist_newgateway(gateway=gw)
+-        self.rsync_roots(gw)
+-        node = WorkerController(self, gw, self.config, putevent)
+-        # Keep the node alive.
+-        gw.node = node  # type: ignore[attr-defined]
++        gateway = self.group.makegateway(spec)
++        self.config.hook.pytest_xdist_newgateway(gateway=gateway)
++        self.rsync_roots(gateway)
++        
++        factory = self.factory_registry.get_factory(spec)
++        node = factory.create_worker(self, gateway, self.config, putevent)
++        
++        gateway.node = node  # type: ignore[attr-defined]
+         node.setup()
+         self.trace("started node %r" % node)
+         return node
+@@ -132,7 +257,6 @@ class NodeManager:
+         import pytest
+ 
+         def get_dir(p: str) -> str:
+-            """Return the directory path if p is a package or the path to the .py file otherwise."""
+             stripped = p.rstrip("co")
+             if os.path.basename(stripped) == "__init__.py":
+                 return os.path.dirname(p)
+@@ -157,7 +281,6 @@ class NodeManager:
+         return roots
+ 
+     def _getrsyncoptions(self) -> dict[str, Any]:
+-        """Get options to be passed for rsync."""
+         ignores = list(self.DEFAULT_IGNORES)
+         ignores += [str(path) for path in self.config.option.rsyncignore]
+         ignores += [str(path) for path in self.config.getini("rsyncignore")]
+@@ -177,15 +300,9 @@ class NodeManager:
+         verbose: int = False,
+         ignores: Sequence[str] | None = None,
+     ) -> None:
+-        """Perform rsync to remote hosts for node."""
+-        # XXX This changes the calling behaviour of
+-        #     pytest_xdist_rsyncstart and pytest_xdist_rsyncfinish to
+-        #     be called once per rsync target.
+         rsync = HostRSync(source, verbose=verbose > 0, ignores=ignores)
+         spec = gateway.spec
+         if spec.popen and not spec.chdir:
+-            # XXX This assumes that sources are python-packages
+-            #     and that adding the basedir does not hurt.
+             gateway.remote_exec(
+                 """
+                 import sys ; sys.path.insert(0, %r)
+@@ -208,7 +325,6 @@ class NodeManager:
+ 
+ 
+ class HostRSync(execnet.RSync):
+-    """RSyncer that filters out common files."""
+ 
+     PathLike = Union[str, "os.PathLike[str]"]
+ 
+@@ -242,7 +358,7 @@ class HostRSync(execnet.RSync):
+ 
+     def _report_send_file(
+         self,
+-        gateway: execnet.Gateway,  # type: ignore[override]
++        gateway: execnet.Gateway,
+         modified_rel_path: str,
+     ) -> None:
+         if self._verbose > 0:
+@@ -252,7 +368,6 @@ class HostRSync(execnet.RSync):
+ 
+ 
+ def make_reltoroot(roots: Sequence[Path], args: list[str]) -> list[str]:
+-    # XXX introduce/use public API for splitting pytest args
+     splitcode = "::"
+     result = []
+     for arg in args:
+@@ -284,8 +399,8 @@ class Marker(enum.Enum):
+     END = -1
+ 
+ 
+-class WorkerController:
+-    # Set when the worker is ready.
++class WorkerController(Worker):
++
+     workerinfo: WorkerInfo
+ 
+     class RemoteHook:
+@@ -324,10 +439,6 @@ class WorkerController:
+ 
+     def setup(self) -> None:
+         self.log("setting up worker session")
+-        # Cache rinfo for backward compatibility, since pytest-cov
+-        # accesses rinfo while the main thread is busy executing our
+-        # remote_exec call, which triggers a deadlock error for the
+-        # main_thread_only execmodel if the rinfo has not been cached.
+         self.gateway._rinfo()
+         spec = self.gateway.spec
+         args = [str(x) for x in self.config.invocation_params.args or ()]
+@@ -343,13 +454,10 @@ class WorkerController:
+ 
+         remote_module = self.config.hook.pytest_xdist_getremotemodule()
+         self.channel = self.gateway.remote_exec(remote_module)
+-        # change sys.path only for remote workers
+-        # restore sys.path from a frozen copy for local workers
+         change_sys_path = _sys_path if self.gateway.spec.popen else None
+         self.channel.send((self.workerinput, args, option_dict, change_sys_path))
+ 
+-        # putevent is only None in a test.
+-        if self.putevent:  # type: ignore[truthy-function]
++        if self.putevent:
+             self.channel.setcallback(self.process_from_remote, endmarker=Marker.END)
+ 
+     def ensure_teardown(self) -> None:
+@@ -357,11 +465,9 @@ class WorkerController:
+             if not self.channel.isclosed():
+                 self.log("closing", self.channel)
+                 self.channel.close()
+-            # del self.channel
+         if hasattr(self, "gateway"):
+             self.log("exiting", self.gateway)
+             self.gateway.exit()
+-            # del self.gateway
+ 
+     def send_runtest_some(self, indices: Sequence[int]) -> None:
+         self.sendcommand("runtests", indices=indices)
+@@ -381,7 +487,6 @@ class WorkerController:
+             self._shutdown_sent = True
+ 
+     def sendcommand(self, name: str, **kwargs: object) -> None:
+-        """Send a named parametrized command to the other side."""
+         self.log(f"sending command {name}(**{kwargs})")
+         self.channel.send((name, kwargs))
+ 
+@@ -392,19 +497,12 @@ class WorkerController:
+     def process_from_remote(
+         self, eventcall: tuple[str, dict[str, Any]] | Literal[Marker.END]
+     ) -> None:
+-        """This gets called for each object we receive from
+-        the other side and if the channel closes.
+-
+-        Note that channel callbacks run in the receiver
+-        thread of execnet gateways - we need to
+-        avoid raising exceptions or doing heavy work.
+-        """
+         try:
+             if eventcall is Marker.END:
+-                err: object | None = self.channel._getremoteerror()  # type: ignore[no-untyped-call]
++                err: object | None = self.channel._getremoteerror()
+                 if not self._down:
+                     if not err or isinstance(err, EOFError):
+-                        err = "Not properly terminated"  # lost connection?
++                        err = "Not properly terminated"
+                     self.notify_inproc("errordown", node=self, error=err)
+                     self._down = True
+                 return
+@@ -457,7 +555,6 @@ class WorkerController:
+             else:
+                 raise ValueError(f"unknown event: {eventname}")
+         except KeyboardInterrupt:
+-            # should not land in receiver-thread
+             raise
+         except BaseException:
+             excinfo = pytest.ExceptionInfo.from_current()
+@@ -480,9 +577,6 @@ def unserialize_warning_message(data: dict[str, Any]) -> warnings.WarningMessage
+             except TypeError:
+                 pass
+         if message is None:
+-            # could not recreate the original warning instance;
+-            # create a generic Warning instance with the original
+-            # message at least
+             message_text = "{mod}.{cls}: {msg}".format(
+                 mod=data["message_module"],
+                 cls=data["message_class_name"],
+@@ -499,8 +593,7 @@ def unserialize_warning_message(data: dict[str, Any]) -> warnings.WarningMessage
+         category = None
+ 
+     kwargs = {"message": message, "category": category}
+-    # access private _WARNING_DETAILS because the attributes vary between Python versions
+-    for attr_name in warnings.WarningMessage._WARNING_DETAILS:  # type: ignore[attr-defined]
++    for attr_name in warnings.WarningMessage._WARNING_DETAILS:
+         if attr_name in ("message", "category"):
+             continue
+         kwargs[attr_name] = data[attr_name]
