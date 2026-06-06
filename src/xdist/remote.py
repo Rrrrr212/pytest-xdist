@@ -314,6 +314,34 @@ class WorkerInteractor:
         )
 
 
+class RemoteWorker:
+    def __init__(
+        self,
+        channel: execnet.Channel,
+        retry_count: int = 3,
+        retry_timeout: float = 10.0,
+    ) -> None:
+        self.channel = channel
+        self.retry_count = retry_count
+        self.retry_timeout = retry_timeout
+
+    def send_command(self, name: str, **kwargs: object) -> None:
+        for attempt in range(self.retry_count):
+            try:
+                self.channel.send((name, kwargs))
+                return
+            except self.channel.TimeoutError:
+                if attempt == self.retry_count - 1:
+                    raise TimeoutError(
+                        f"send_command('{name}') timed out"
+                        f" after {self.retry_count} attempts"
+                    )
+            except (EOFError, OSError) as e:
+                raise ConnectionError(
+                    f"Connection lost while sending command '{name}': {e}"
+                ) from e
+
+
 def serialize_warning_message(
     warning_message: warnings.WarningMessage,
 ) -> dict[str, Any]:
