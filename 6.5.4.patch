@@ -1,0 +1,77 @@
+diff --git a/src/xdist/dsession.py b/src/xdist/dsession.py
+index 47e1de7..4a9fb6a 100644
+--- a/src/xdist/dsession.py
++++ b/src/xdist/dsession.py
+@@ -15,6 +15,7 @@ import pytest
+ from xdist.remote import Producer
+ from xdist.remote import WorkerInfo
+ from xdist.scheduler import EachScheduling
++from xdist.scheduler import LoadBalanceScheduling
+ from xdist.scheduler import LoadFileScheduling
+ from xdist.scheduler import LoadGroupScheduling
+ from xdist.scheduler import LoadScheduling
+@@ -121,6 +122,8 @@ class DSession:
+             return LoadFileScheduling(config, log)
+         if dist == "loadgroup":
+             return LoadGroupScheduling(config, log)
++        if dist == "loadbalance":
++            return LoadBalanceScheduling(config, log)
+         if dist == "worksteal":
+             return WorkStealingScheduling(config, log)
+         return None
+diff --git a/src/xdist/plugin.py b/src/xdist/plugin.py
+index d8553ce..4069eff 100644
+--- a/src/xdist/plugin.py
++++ b/src/xdist/plugin.py
+@@ -188,6 +188,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "loadscope",
+             "loadfile",
+             "loadgroup",
++            "loadbalance",
+             "worksteal",
+             "no",
+         ],
+@@ -203,6 +204,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "loadfile: Load balance by sending test grouped by file"
+             " to any available environment.\n\n"
+             "loadgroup: Like 'load', but sends tests marked with 'xdist_group' to the same worker.\n\n"
++            "loadbalance: Load balance by grouping tests by file and distributing"
++            " them using file size or historical execution time"
++            " (see --load-group).\n\n"
+             "worksteal: Split the test suite between available environments,"
+             " then re-balance when any worker runs out of tests.\n\n"
+             "(default) no: Run tests inprocess, don't distribute."
+@@ -234,6 +238,22 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "other plugins that specify tests in a specific order."
+         ),
+     )
++    group.addoption(
++        "--load-group",
++        metavar="loadgroup",
++        action="store",
++        choices=["size", "time"],
++        dest="load_group",
++        default="size",
++        help=(
++            "Set the strategy for intelligent load balancing when using"
++            " --dist=loadbalance.\n\n"
++            "size: Distribute work units weighted by source file size"
++            " (default).\n\n"
++            "time: Distribute work units weighted by historical execution"
++            " duration read from .pytest_cache/xdist_durations/durations.json."
++        ),
++    )
+     group.addoption(
+         "--tx",
+         dest="tx",
+diff --git a/src/xdist/scheduler/__init__.py b/src/xdist/scheduler/__init__.py
+index b489473..b1f8369 100644
+--- a/src/xdist/scheduler/__init__.py
++++ b/src/xdist/scheduler/__init__.py
+@@ -1,5 +1,6 @@
+ from xdist.scheduler.each import EachScheduling as EachScheduling
+ from xdist.scheduler.load import LoadScheduling as LoadScheduling
++from xdist.scheduler.loadbalance import LoadBalanceScheduling as LoadBalanceScheduling
+ from xdist.scheduler.loadfile import LoadFileScheduling as LoadFileScheduling
+ from xdist.scheduler.loadgroup import LoadGroupScheduling as LoadGroupScheduling
+ from xdist.scheduler.loadscope import LoadScopeScheduling as LoadScopeScheduling

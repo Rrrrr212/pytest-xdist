@@ -188,6 +188,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadscope",
             "loadfile",
             "loadgroup",
+            "loadbalance",
             "worksteal",
             "no",
         ],
@@ -203,6 +204,9 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadfile: Load balance by sending test grouped by file"
             " to any available environment.\n\n"
             "loadgroup: Like 'load', but sends tests marked with 'xdist_group' to the same worker.\n\n"
+            "loadbalance: Load balance by grouping tests by file and distributing"
+            " them using file size or historical execution time"
+            " (see --load-group).\n\n"
             "worksteal: Split the test suite between available environments,"
             " then re-balance when any worker runs out of tests.\n\n"
             "(default) no: Run tests inprocess, don't distribute."
@@ -232,6 +236,22 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "and the partial order of tests can be retained.\n"
             "This is useful when pytest-xdist is used together with "
             "other plugins that specify tests in a specific order."
+        ),
+    )
+    group.addoption(
+        "--load-group",
+        metavar="loadgroup",
+        action="store",
+        choices=["size", "time"],
+        dest="load_group",
+        default="size",
+        help=(
+            "Set the strategy for intelligent load balancing when using"
+            " --dist=loadbalance.\n\n"
+            "size: Distribute work units weighted by source file size"
+            " (default).\n\n"
+            "time: Distribute work units weighted by historical execution"
+            " duration read from .pytest_cache/xdist_durations/durations.json."
         ),
     )
     group.addoption(

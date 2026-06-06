@@ -15,6 +15,7 @@ import pytest
 from xdist.remote import Producer
 from xdist.remote import WorkerInfo
 from xdist.scheduler import EachScheduling
+from xdist.scheduler import LoadBalanceScheduling
 from xdist.scheduler import LoadFileScheduling
 from xdist.scheduler import LoadGroupScheduling
 from xdist.scheduler import LoadScheduling
@@ -121,6 +122,8 @@ class DSession:
             return LoadFileScheduling(config, log)
         if dist == "loadgroup":
             return LoadGroupScheduling(config, log)
+        if dist == "loadbalance":
+            return LoadBalanceScheduling(config, log)
         if dist == "worksteal":
             return WorkStealingScheduling(config, log)
         return None
