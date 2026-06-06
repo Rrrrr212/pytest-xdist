@@ -71,10 +71,12 @@ def looponfail_main(config: pytest.Config) -> None:
 
 class RemoteControl:
     gateway: execnet.Gateway
+    EXIT_TIMEOUT = 10
 
     def __init__(self, config: pytest.Config) -> None:
         self.config = config
         self.failures: list[str] = []
+        self.group = execnet.Group(execmodel="main_thread_only")
 
     def trace(self, *args: object) -> None:
         if self.config.option.debug:
@@ -82,7 +84,7 @@ class RemoteControl:
             print("RemoteControl:", msg)
 
     def initgateway(self) -> execnet.Gateway:
-        return execnet.makegateway("execmodel=main_thread_only//popen")
+        return self.group.makegateway("execmodel=main_thread_only//popen")
 
     def setup(self) -> None:
         if hasattr(self, "gateway"):
@@ -112,7 +114,7 @@ class RemoteControl:
             del self.channel
         if hasattr(self, "gateway"):
             self.trace("exiting", self.gateway)
-            self.gateway.exit()
+            self.group.terminate(self.EXIT_TIMEOUT)
             del self.gateway
 
     def runsession(self) -> tuple[list[str], list[str], bool]:
