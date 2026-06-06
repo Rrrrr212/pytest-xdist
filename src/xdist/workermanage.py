@@ -21,7 +21,6 @@ from xdist.plugin import _sys_path
 import xdist.remote
 from xdist.remote import Producer
 from xdist.remote import WorkerInfo
-from xdist.worker_factory import WorkerType, WorkerFactoryRegistry, IWorker
 
 
 def parse_tx_spec_config(config: pytest.Config) -> list[str]:
@@ -51,7 +50,6 @@ class NodeManager:
         config: pytest.Config,
         specs: Sequence[execnet.XSpec | str] | None = None,
         defaultchdir: str = "pyexecnetcache",
-        worker_type: WorkerType = WorkerType.PROCESS,
     ) -> None:
         self.config = config
         self.trace = self.config.trace.get("nodemanager")
@@ -59,8 +57,10 @@ class NodeManager:
         if self.testrunuid is None:
             self.testrunuid = uuid.uuid4().hex
         self.group = execnet.Group(execmodel="main_thread_only")
-        self.worker_type = worker_type
         for proxy_spec in self._getpxspecs():
+            # Proxy gateways do not run workers, and are meant to be passed with the `via` attribute
+            # to additional gateways.
+            # They are useful for running multiple workers on remote machines.
             if getattr(proxy_spec, "id", None) is None:
                 raise pytest.UsageError(
                     f"Proxy gateway {proxy_spec} must include an id"
@@ -100,19 +100,15 @@ class NodeManager:
         self,
         spec: execnet.XSpec,
         putevent: Callable[[tuple[str, dict[str, Any]]], None],
-    ) -> IWorker:
+    ) -> WorkerController:
         if getattr(spec, "execmodel", None) != "main_thread_only":
             spec = execnet.XSpec(f"execmodel=main_thread_only//{spec}")
         gw = self.group.makegateway(spec)
         self.config.hook.pytest_xdist_newgateway(gateway=gw)
         self.rsync_roots(gw)
-        
-        factory = WorkerFactoryRegistry.get_factory(
-            self.worker_type, self, gw, self.config, putevent
-        )
-        node = factory.create_worker()
-        
-        gw.node = node
+        node = WorkerController(self, gw, self.config, putevent)
+        # Keep the node alive.
+        gw.node = node  # type: ignore[attr-defined]
         node.setup()
         self.trace("started node %r" % node)
         return node
