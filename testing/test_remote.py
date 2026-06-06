@@ -424,3 +424,149 @@ def test_remote_sys_path(pytester: pytest.Pytester) -> None:
     )
     result = pytester.runpytest("-n1")
     assert result.ret == 0
+
+
+class TestSendCommand:
+    """Test cases for the enhanced send_command method."""
+    
+    def test_send_command_success(self) -> None:
+        """Test normal command sending works correctly."""
+        from unittest.mock import Mock
+        
+        # Create mock dependencies
+        mock_nodemanager = Mock()
+        mock_gateway = Mock()
+        mock_config = Mock()
+        mock_config.option.debug = False
+        mock_putevent = Mock()
+        
+        # Create WorkerController instance
+        from xdist.workermanage import WorkerController
+        worker = WorkerController(mock_nodemanager, mock_gateway, mock_config, mock_putevent)
+        
+        # Mock channel
+        worker.channel = Mock()
+        worker.channel.isclosed.return_value = False
+        worker._down = False
+        
+        # Test sendcommand
+        worker.sendcommand("test_command", arg1="value1", arg2=123)
+        
+        # Verify the command was sent
+        worker.channel.send.assert_called_once_with(("test_command", {"arg1": "value1", "arg2": 123}))
+    
+    def test_send_command_connection_disconnected(self) -> None:
+        """Test send_command handles connection disconnection properly."""
+        from unittest.mock import Mock
+        import pytest
+        
+        # Create mock dependencies
+        mock_nodemanager = Mock()
+        mock_gateway = Mock()
+        mock_config = Mock()
+        mock_config.option.debug = False
+        mock_putevent = Mock()
+        
+        # Create WorkerController instance
+        from xdist.workermanage import WorkerController
+        worker = WorkerController(mock_nodemanager, mock_gateway, mock_config, mock_putevent)
+        
+        # Mock channel as closed
+        worker.channel = Mock()
+        worker.channel.isclosed.return_value = True
+        worker._down = False
+        
+        # Test sendcommand raises OSError
+        with pytest.raises(OSError, match="Channel is closed"):
+            worker.sendcommand("test_command", arg1="value1")
+    
+    def test_send_command_already_down(self) -> None:
+        """Test send_command handles worker already down."""
+        from unittest.mock import Mock
+        import pytest
+        
+        # Create mock dependencies
+        mock_nodemanager = Mock()
+        mock_gateway = Mock()
+        mock_config = Mock()
+        mock_config.option.debug = False
+        mock_putevent = Mock()
+        
+        # Create WorkerController instance
+        from xdist.workermanage import WorkerController
+        worker = WorkerController(mock_nodemanager, mock_gateway, mock_config, mock_putevent)
+        
+        # Mark worker as down
+        worker._down = True
+        
+        # Test sendcommand raises OSError
+        with pytest.raises(OSError, match="Worker channel is already down"):
+            worker.sendcommand("test_command", arg1="value1")
+    
+    def test_send_command_with_retries_success(self) -> None:
+        """Test send_command retries and eventually succeeds."""
+        from unittest.mock import Mock
+        
+        # Create mock dependencies
+        mock_nodemanager = Mock()
+        mock_gateway = Mock()
+        mock_config = Mock()
+        mock_config.option.debug = False
+        mock_putevent = Mock()
+        
+        # Create WorkerController instance
+        from xdist.workermanage import WorkerController
+        worker = WorkerController(mock_nodemanager, mock_gateway, mock_config, mock_putevent)
+        
+        # Mock channel
+        worker.channel = Mock()
+        worker.channel.isclosed.return_value = False
+        worker._down = False
+        
+        # Make channel.send fail first 2 times, then succeed
+        call_count = 0
+        
+        def side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise OSError("Connection reset")
+        
+        worker.channel.send.side_effect = side_effect
+        
+        # Test sendcommand succeeds after retries
+        worker.sendcommand("test_command", arg1="value1", max_retries=3, retry_delay=0)
+        
+        # Verify it was retried and eventually succeeded
+        assert worker.channel.send.call_count == 3
+    
+    def test_send_command_exhausts_retries(self) -> None:
+        """Test send_command raises exception after all retries fail."""
+        from unittest.mock import Mock
+        import pytest
+        
+        # Create mock dependencies
+        mock_nodemanager = Mock()
+        mock_gateway = Mock()
+        mock_config = Mock()
+        mock_config.option.debug = False
+        mock_putevent = Mock()
+        
+        # Create WorkerController instance
+        from xdist.workermanage import WorkerController
+        worker = WorkerController(mock_nodemanager, mock_gateway, mock_config, mock_putevent)
+        
+        # Mock channel
+        worker.channel = Mock()
+        worker.channel.isclosed.return_value = False
+        worker._down = False
+        
+        # Make channel.send always fail
+        worker.channel.send.side_effect = OSError("Connection error")
+        
+        # Test sendcommand raises exception after all retries
+        with pytest.raises(OSError, match="Connection error"):
+            worker.sendcommand("test_command", arg1="value1", max_retries=2, retry_delay=0)
+        
+        # Verify it was called max_retries + 1 times
+        assert worker.channel.send.call_count == 3
