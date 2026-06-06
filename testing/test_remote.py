@@ -3,25 +3,21 @@ from __future__ import annotations
 import marshal
 import pprint
 from queue import Queue
-import socket
 import sys
 from typing import Any
 from typing import Callable
 from typing import cast
 from typing import Union
-import unittest.mock
 import uuid
 
 import execnet
 import pytest
 
-import xdist.remote as remote
 from xdist.workermanage import NodeManager
 from xdist.workermanage import WorkerController
 
 
 WAIT_TIMEOUT = 10.0
-RemoteWorker = getattr(remote, "RemoteWorker", None)
 
 
 def check_marshallable(d: object) -> None:
@@ -338,96 +334,6 @@ class TestWorkerInteractor:
 
         ev = worker.popevent("workerfinished")
         assert "workeroutput" in ev.kwargs
-
-
-@pytest.mark.skipif(
-    RemoteWorker is None or not hasattr(RemoteWorker, "send_command"),
-    reason="RemoteWorker.send_command() is not available in this branch",
-)
-class TestRemoteWorkerSendCommand:
-    def make_remote_worker(
-        self,
-    ) -> tuple[Any, unittest.mock.Mock, unittest.mock.Mock]:
-        worker = RemoteWorker.__new__(RemoteWorker)
-        transport = unittest.mock.Mock()
-        sender = unittest.mock.Mock()
-        transport.send = sender
-        transport.sendall = sender
-        transport.write = sender
-        transport.closed = False
-
-        for attr in (
-            "socket",
-            "sock",
-            "_socket",
-            "connection",
-            "_connection",
-            "transport",
-            "_transport",
-            "channel",
-            "_channel",
-        ):
-            setattr(worker, attr, transport)
-
-        encoder = unittest.mock.Mock(return_value=b"payload")
-        for attr in (
-            "_encode_command",
-            "_serialize_command",
-            "serialize_command",
-            "encode_command",
-            "_build_message",
-        ):
-            setattr(worker, attr, encoder)
-
-        for attr, value in (
-            ("send_retries", 1),
-            ("max_send_retries", 1),
-            ("command_retries", 1),
-            ("retry_count", 1),
-            ("send_retry_interval", 0),
-            ("retry_interval", 0),
-            ("command_retry_interval", 0),
-            ("send_timeout", 0.01),
-            ("command_timeout", 0.01),
-        ):
-            setattr(worker, attr, value)
-
-        worker.connected = True
-        worker._connected = True
-        worker.log = unittest.mock.Mock()
-        return worker, sender, encoder
-
-    def test_send_command_sends_payload(self) -> None:
-        worker, sender, encoder = self.make_remote_worker()
-
-        worker.send_command("runtests", indices=[1, 2])
-
-        sender.assert_called_once_with(unittest.mock.ANY)
-        if encoder.called:
-            encoder.assert_any_call("runtests", indices=[1, 2])
-
-    def test_send_command_retries_once_after_timeout(self) -> None:
-        worker, sender, encoder = self.make_remote_worker()
-        sender.side_effect = [socket.timeout("timed out"), None]
-
-        with unittest.mock.patch("xdist.remote.time.sleep") as sleep:
-            worker.send_command("runtests", indices=[1, 2])
-
-        assert sender.call_count == 2
-        sleep.assert_called_once()
-        if encoder.called:
-            encoder.assert_any_call("runtests", indices=[1, 2])
-
-    def test_send_command_raises_on_broken_connection(self) -> None:
-        worker, sender, _encoder = self.make_remote_worker()
-        sender.side_effect = BrokenPipeError("remote worker disconnected")
-
-        with unittest.mock.patch("xdist.remote.time.sleep") as sleep:
-            with pytest.raises(ConnectionError):
-                worker.send_command("shutdown")
-
-        assert sender.call_count == 1
-        sleep.assert_not_called()
 
 
 def test_remote_env_vars(pytester: pytest.Pytester) -> None:
