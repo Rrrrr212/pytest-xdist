@@ -94,7 +94,7 @@ class RemoteControl:
             args=self.config.args,
             option_dict=vars(self.config.option),
         )
-        self.remote_outchannel: execnet.Channel = channel.receive()
+        remote_outchannel: execnet.Channel = channel.receive()
 
         out = TerminalWriter()
 
@@ -102,14 +102,9 @@ class RemoteControl:
             out._file.write(s)
             out._file.flush()
 
-        self.remote_outchannel.setcallback(write)
+        remote_outchannel.setcallback(write)
 
     def ensure_teardown(self) -> None:
-        if hasattr(self, "remote_outchannel"):
-            if not self.remote_outchannel.isclosed():
-                self.trace("closing remote_outchannel", self.remote_outchannel)
-                self.remote_outchannel.close()
-            del self.remote_outchannel
         if hasattr(self, "channel"):
             if not self.channel.isclosed():
                 self.trace("closing", self.channel)
@@ -118,21 +113,7 @@ class RemoteControl:
         if hasattr(self, "gateway"):
             self.trace("exiting", self.gateway)
             self.gateway.exit()
-            self._wait_gateway_process()
             del self.gateway
-
-    def _wait_gateway_process(self) -> None:
-        popen = getattr(self.gateway, "_popen", None)
-        if popen is not None and popen.poll() is None:
-            try:
-                self.trace("waiting for worker process to terminate")
-                popen.wait(timeout=10)
-            except Exception:
-                self.trace("worker process did not terminate in time, killing")
-                try:
-                    popen.kill()
-                except Exception:
-                    pass
 
     def runsession(self) -> tuple[list[str], list[str], bool]:
         try:
