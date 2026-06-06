@@ -365,53 +365,6 @@ def serialize_warning_message(
     return result
 
 
-class RemoteWorker:
-    """A worker that sends commands to the remote channel with retry support."""
-
-    def __init__(
-        self,
-        channel: execnet.Channel,
-        timeout: float = 5.0,
-        max_retries: int = 3,
-    ) -> None:
-        self.channel = channel
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.log = Producer("remote-worker", enabled=True)
-
-    def send_command(self, name: str, **kwargs: Any) -> bool:
-        """
-        Send a command to the remote channel with timeout and retry support.
-
-        :param name: The command name.
-        :param kwargs: Additional keyword arguments for the command.
-        :return: True if the command was sent successfully, False otherwise.
-        :raises ConnectionError: If the connection is broken and cannot be recovered.
-        """
-        command = (name, kwargs)
-        last_exception: Exception | None = None
-
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                self.log("sending command", name, "attempt", attempt)
-                self.channel.send(command, timeout=self.timeout)
-                return True
-            except execnet.Channel.TimeoutError as e:
-                last_exception = e
-                self.log("timeout on attempt", attempt, "of", self.max_retries)
-                if attempt < self.max_retries:
-                    time.sleep(0.1 * attempt)
-                    continue
-            except execnet.RemoteError as e:
-                raise ConnectionError(
-                    f"Connection broken while sending command '{name}': {e}"
-                ) from e
-
-        raise TimeoutError(
-            f"Failed to send command '{name}' after {self.max_retries} attempts: {last_exception}"
-        ) from last_exception
-
-
 class WorkerInfo(TypedDict):
     version: str
     version_info: tuple[int, int, int, str, int]
