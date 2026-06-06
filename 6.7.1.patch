@@ -1,0 +1,55 @@
+diff --git a/.github/workflows/test-matrix.yml b/.github/workflows/test-matrix.yml
+new file mode 100644
+index 0000000..4a1170c
+--- /dev/null
++++ b/.github/workflows/test-matrix.yml
+@@ -0,0 +1,49 @@
++name: test-matrix
++
++on:
++  push:
++    branches:
++      - master
++      - "test-me-*"
++  pull_request:
++    branches:
++      - "*"
++
++concurrency:
++  group: ${{ github.workflow }}-${{ github.ref }}
++  cancel-in-progress: true
++
++jobs:
++  test-matrix:
++    runs-on: ubuntu-latest
++    strategy:
++      fail-fast: false
++      matrix:
++        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
++
++    steps:
++    - uses: actions/checkout@v6
++      with:
++        fetch-depth: 0
++
++    - name: Set up Python ${{ matrix.python-version }}
++      uses: actions/setup-python@v6
++      with:
++        python-version: ${{ matrix.python-version }}
++
++    - name: Install dependencies
++      run: |
++        python -m pip install --upgrade pip
++        pip install -e ".[testing]"
++        pip install pytest-html
++
++    - name: Run tests with xdist (4 workers)
++      run: |
++        pytest testing/ -n 4 --html=test-report.html --self-contained-html
++
++    - name: Upload test report
++      uses: actions/upload-artifact@v4
++      with:
++        name: test-report-py${{ matrix.python-version }}
++        path: test-report.html
++        retention-days: 14
