@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from abc import ABC
-from abc import abstractmethod
 from collections.abc import Sequence
 import enum
 import fnmatch
@@ -43,259 +41,6 @@ def parse_tx_spec_config(config: pytest.Config) -> list[str]:
     return xspeclist
 
 
-# ---------------------------------------------------------------------------
-#  Abstract Worker Factory
-# ---------------------------------------------------------------------------
-
-
-class AbstractWorkerFactory(ABC):
-    """Abstract factory for creating worker controllers.
-
-    Decouples worker instantiation from the NodeManager, enabling
-    pluggable worker backends (process, thread, remote, etc.).
-    """
-
-    def __init__(self, nodemanager: NodeManager) -> None:
-        self.nodemanager = nodemanager
-
-    @abstractmethod
-    def create_worker_controller(
-        self,
-        spec: execnet.XSpec,
-        putevent: Callable[[tuple[str, dict[str, Any]]], None],
-    ) -> WorkerController: ...
-
-    @abstractmethod
-    def teardown(self, timeout: float = 10.0) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-#  Execnet-based factories (shared gateway lifecycle)
-# ---------------------------------------------------------------------------
-
-
-class _ExecnetWorkerFactory(AbstractWorkerFactory):
-    """Base for execnet-based factories that share gateway lifecycle management."""
-
-    def __init__(self, nodemanager: NodeManager) -> None:
-        super().__init__(nodemanager)
-        self._group = execnet.Group(execmodel="main_thread_only")
-
-    def _ensure_execmodel(self, spec: execnet.XSpec) -> execnet.XSpec:
-        if getattr(spec, "execmodel", None) != "main_thread_only":
-            return execnet.XSpec(f"execmodel=main_thread_only//{spec}")
-        return spec
-
-    def _make_gateway(self, spec: execnet.XSpec) -> execnet.Gateway:
-        spec = self._ensure_execmodel(spec)
-        gw = self._group.makegateway(spec)
-        self.nodemanager.config.hook.pytest_xdist_newgateway(gateway=gw)
-        self.nodemanager.rsync_roots(gw)
-        return gw
-
-    def teardown(self, timeout: float = 10.0) -> None:
-        self._group.terminate(timeout)
-
-
-class ProcessWorkerFactory(_ExecnetWorkerFactory):
-    """Creates workers via execnet *popen* gateways (local subprocesses)."""
-
-    def create_worker_controller(
-        self,
-        spec: execnet.XSpec,
-        putevent: Callable[[tuple[str, dict[str, Any]]], None],
-    ) -> WorkerController:
-        gw = self._make_gateway(spec)
-        node = WorkerController(self.nodemanager, gw, self.nodemanager.config, putevent)
-        gw.node = node  # type: ignore[attr-defined]
-        node.setup()
-        self.nodemanager.trace("started process-worker %r" % node)
-        return node
-
-
-class RemoteWorkerFactory(_ExecnetWorkerFactory):
-    """Creates workers via execnet *ssh* / *socket* gateways (remote hosts)."""
-
-    def create_worker_controller(
-        self,
-        spec: execnet.XSpec,
-        putevent: Callable[[tuple[str, dict[str, Any]]], None],
-    ) -> WorkerController:
-        gw = self._make_gateway(spec)
-        node = WorkerController(self.nodemanager, gw, self.nodemanager.config, putevent)
-        gw.node = node  # type: ignore[attr-defined]
-        node.setup()
-        self.nodemanager.trace("started remote-worker %r" % node)
-        return node
-
-
-# ---------------------------------------------------------------------------
-#  Thread-based worker factory
-# ---------------------------------------------------------------------------
-
-
-class ThreadWorkerFactory(AbstractWorkerFactory):
-    """Creates workers that run inside the same process using threads.
-
-    This is a lightweight alternative to subprocess workers, suitable
-    for debugging or resource-constrained environments.
-    """
-
-    def __init__(self, nodemanager: NodeManager) -> None:
-        super().__init__(nodemanager)
-        self._controllers: list[WorkerController] = []
-
-    def create_worker_controller(
-        self,
-        spec: execnet.XSpec,
-        putevent: Callable[[tuple[str, dict[str, Any]]], None],
-    ) -> WorkerController:
-        gw = ThreadGateway(spec)
-        self.nodemanager.config.hook.pytest_xdist_newgateway(gateway=gw)
-        node = WorkerController(self.nodemanager, gw, self.nodemanager.config, putevent)
-        gw.node = node  # type: ignore[attr-defined]
-        node.setup()
-        self._controllers.append(node)
-        self.nodemanager.trace("started thread-worker %r" % node)
-        return node
-
-    def teardown(self, timeout: float = 10.0) -> None:
-        for node in self._controllers:
-            try:
-                node.ensure_teardown()
-            except Exception:
-                pass
-
-
-# ---------------------------------------------------------------------------
-#  ThreadGateway – minimal execnet.Gateway-compatible stub for thread workers
-# ---------------------------------------------------------------------------
-
-
-class ThreadGateway:
-    """A duck-type compatible gateway that runs worker code in a thread."""
-
-    def __init__(self, spec: execnet.XSpec) -> None:
-        self.spec = spec
-        self.id = getattr(spec, "id", None) or "thread-gw-%d" % id(self)
-        self._channel: ThreadChannel | None = None
-
-    def _rinfo(self) -> None:
-        pass
-
-    def remote_exec(self, module: Any) -> ThreadChannel:
-        from threading import Thread
-
-        ch = ThreadChannel(self)
-        self._channel = ch
-
-        def _run_worker() -> None:
-            import io
-            import pytest
-
-            config = pytest.Config.fromdictargs(
-                {"plugins": []}, []
-            )
-            config.workerinput = ch._workerinput
-            config.pluginmanager.register(module)
-            config.hook.pytest_cmdline_main(config=config)
-
-        Thread(target=_run_worker, daemon=True).start()
-        return ch
-
-    def exit(self) -> None:
-        if self._channel is not None and not self._channel.isclosed():
-            self._channel.close()
-
-
-class ThreadChannel:
-    """Minimal channel implementation for thread-based workers."""
-
-    def __init__(self, gateway: ThreadGateway) -> None:
-        self.gateway = gateway
-        self._closed = False
-        self._callback: Callable[..., Any] | None = None
-        self._endmarker: Any = None
-        self._workerinput: dict[str, Any] = {}
-
-    def send(self, data: Any) -> None:
-        if self._closed:
-            raise OSError("channel closed")
-
-    def setcallback(
-        self,
-        callback: Callable[..., Any],
-        endmarker: Any = None,
-    ) -> None:
-        self._callback = callback
-        self._endmarker = endmarker
-
-    def isclosed(self) -> bool:
-        return self._closed
-
-    def close(self) -> None:
-        self._closed = True
-
-    def _getremoteerror(self) -> object | None:
-        return None
-
-
-# ---------------------------------------------------------------------------
-#  Factory Registry
-# ---------------------------------------------------------------------------
-
-
-class WorkerFactoryRegistry:
-    """Registry that maps worker-type names to factory *classes*.
-
-    Supports auto-detection of the appropriate factory from an execnet
-    XSpec by inspecting ``spec.popen`` and ``spec.ssh`` attributes.
-    """
-
-    def __init__(self) -> None:
-        self._factories: dict[str, type[AbstractWorkerFactory]] = {
-            "process": ProcessWorkerFactory,
-            "remote": RemoteWorkerFactory,
-            "thread": ThreadWorkerFactory,
-        }
-        self._instances: dict[str, AbstractWorkerFactory] = {}
-
-    def register(self, name: str, factory_cls: type[AbstractWorkerFactory]) -> None:
-        self._factories[name] = factory_cls
-
-    def get(self, name: str, nodemanager: NodeManager) -> AbstractWorkerFactory:
-        if name not in self._instances:
-            factory_cls = self._factories.get(name)
-            if factory_cls is None:
-                available = ", ".join(sorted(self._factories))
-                raise ValueError(
-                    f"Unknown worker type '{name}'. Available: {available}"
-                )
-            self._instances[name] = factory_cls(nodemanager)
-        return self._instances[name]
-
-    def get_by_spec(
-        self,
-        spec: execnet.XSpec,
-        nodemanager: NodeManager,
-    ) -> AbstractWorkerFactory:
-        if getattr(spec, "worker_type", None) == "thread":
-            return self.get("thread", nodemanager)
-        if spec.ssh or spec.socket:
-            return self.get("remote", nodemanager)
-        return self.get("process", nodemanager)
-
-    def teardown_all(self, timeout: float = 10.0) -> None:
-        for factory in self._instances.values():
-            factory.teardown(timeout)
-        self._instances.clear()
-
-
-# ---------------------------------------------------------------------------
-#  NodeManager (refactored)
-# ---------------------------------------------------------------------------
-
-
 class NodeManager:
     EXIT_TIMEOUT = 10
     DEFAULT_IGNORES = [".*", "*.pyc", "*.pyo", "*~"]
@@ -311,30 +56,34 @@ class NodeManager:
         self.testrunuid = self.config.getoption("testrunuid")
         if self.testrunuid is None:
             self.testrunuid = uuid.uuid4().hex
-
-        self.registry = WorkerFactoryRegistry()
-
+        self.group = execnet.Group(execmodel="main_thread_only")
+        for proxy_spec in self._getpxspecs():
+            # Proxy gateways do not run workers, and are meant to be passed with the `via` attribute
+            # to additional gateways.
+            # They are useful for running multiple workers on remote machines.
+            if getattr(proxy_spec, "id", None) is None:
+                raise pytest.UsageError(
+                    f"Proxy gateway {proxy_spec} must include an id"
+                )
+            self.group.makegateway(proxy_spec)
         if specs is None:
             specs = self._gettxspecs()
         self.specs: list[execnet.XSpec] = []
         for spec in specs:
             if not isinstance(spec, execnet.XSpec):
                 spec = execnet.XSpec(spec)
-            if not spec.chdir and not spec.popen and not spec.ssh and not spec.socket:
+            if getattr(spec, "execmodel", None) != "main_thread_only":
+                spec = execnet.XSpec(f"execmodel=main_thread_only//{spec}")
+            if not spec.chdir and not spec.popen:
                 spec.chdir = defaultchdir
-            self._ensure_gateway_id(spec)
+            self.group.allocate_id(spec)
             self.specs.append(spec)
-
         self.roots = self._getrsyncdirs()
         self.rsyncoptions = self._getrsyncoptions()
         self._rsynced_specs: set[tuple[Any, Any]] = set()
 
-    def _ensure_gateway_id(self, spec: execnet.XSpec) -> None:
-        factory = self.registry.get_by_spec(spec, self)
-        if isinstance(factory, _ExecnetWorkerFactory):
-            factory._group.allocate_id(spec)
-
     def rsync_roots(self, gateway: execnet.Gateway) -> None:
+        """Rsync the set of roots to the node's gateway cwd."""
         if self.roots:
             for root in self.roots:
                 self.rsync(gateway, root, **self.rsyncoptions)
@@ -352,16 +101,26 @@ class NodeManager:
         spec: execnet.XSpec,
         putevent: Callable[[tuple[str, dict[str, Any]]], None],
     ) -> WorkerController:
-        factory = self.registry.get_by_spec(spec, self)
-        node = factory.create_worker_controller(spec, putevent)
+        if getattr(spec, "execmodel", None) != "main_thread_only":
+            spec = execnet.XSpec(f"execmodel=main_thread_only//{spec}")
+        gw = self.group.makegateway(spec)
+        self.config.hook.pytest_xdist_newgateway(gateway=gw)
+        self.rsync_roots(gw)
+        node = WorkerController(self, gw, self.config, putevent)
+        # Keep the node alive.
+        gw.node = node  # type: ignore[attr-defined]
+        node.setup()
         self.trace("started node %r" % node)
         return node
 
     def teardown_nodes(self) -> None:
-        self.registry.teardown_all(self.EXIT_TIMEOUT)
+        self.group.terminate(self.EXIT_TIMEOUT)
 
     def _gettxspecs(self) -> list[execnet.XSpec]:
         return [execnet.XSpec(x) for x in parse_tx_spec_config(self.config)]
+
+    def _getpxspecs(self) -> list[execnet.XSpec]:
+        return [execnet.XSpec(x) for x in self.config.getoption("px")]
 
     def _getrsyncdirs(self) -> list[Path]:
         for spec in self.specs:
@@ -373,6 +132,7 @@ class NodeManager:
         import pytest
 
         def get_dir(p: str) -> str:
+            """Return the directory path if p is a package or the path to the .py file otherwise."""
             stripped = p.rstrip("co")
             if os.path.basename(stripped) == "__init__.py":
                 return os.path.dirname(p)
@@ -397,6 +157,7 @@ class NodeManager:
         return roots
 
     def _getrsyncoptions(self) -> dict[str, Any]:
+        """Get options to be passed for rsync."""
         ignores = list(self.DEFAULT_IGNORES)
         ignores += [str(path) for path in self.config.option.rsyncignore]
         ignores += [str(path) for path in self.config.getini("rsyncignore")]
@@ -416,9 +177,15 @@ class NodeManager:
         verbose: int = False,
         ignores: Sequence[str] | None = None,
     ) -> None:
+        """Perform rsync to remote hosts for node."""
+        # XXX This changes the calling behaviour of
+        #     pytest_xdist_rsyncstart and pytest_xdist_rsyncfinish to
+        #     be called once per rsync target.
         rsync = HostRSync(source, verbose=verbose > 0, ignores=ignores)
         spec = gateway.spec
         if spec.popen and not spec.chdir:
+            # XXX This assumes that sources are python-packages
+            #     and that adding the basedir does not hurt.
             gateway.remote_exec(
                 """
                 import sys ; sys.path.insert(0, %r)
@@ -485,6 +252,7 @@ class HostRSync(execnet.RSync):
 
 
 def make_reltoroot(roots: Sequence[Path], args: list[str]) -> list[str]:
+    # XXX introduce/use public API for splitting pytest args
     splitcode = "::"
     result = []
     for arg in args:
@@ -517,6 +285,7 @@ class Marker(enum.Enum):
 
 
 class WorkerController:
+    # Set when the worker is ready.
     workerinfo: WorkerInfo
 
     class RemoteHook:
@@ -555,6 +324,10 @@ class WorkerController:
 
     def setup(self) -> None:
         self.log("setting up worker session")
+        # Cache rinfo for backward compatibility, since pytest-cov
+        # accesses rinfo while the main thread is busy executing our
+        # remote_exec call, which triggers a deadlock error for the
+        # main_thread_only execmodel if the rinfo has not been cached.
         self.gateway._rinfo()
         spec = self.gateway.spec
         args = [str(x) for x in self.config.invocation_params.args or ()]
@@ -570,9 +343,12 @@ class WorkerController:
 
         remote_module = self.config.hook.pytest_xdist_getremotemodule()
         self.channel = self.gateway.remote_exec(remote_module)
+        # change sys.path only for remote workers
+        # restore sys.path from a frozen copy for local workers
         change_sys_path = _sys_path if self.gateway.spec.popen else None
         self.channel.send((self.workerinput, args, option_dict, change_sys_path))
 
+        # putevent is only None in a test.
         if self.putevent:  # type: ignore[truthy-function]
             self.channel.setcallback(self.process_from_remote, endmarker=Marker.END)
 
@@ -581,9 +357,11 @@ class WorkerController:
             if not self.channel.isclosed():
                 self.log("closing", self.channel)
                 self.channel.close()
+            # del self.channel
         if hasattr(self, "gateway"):
             self.log("exiting", self.gateway)
             self.gateway.exit()
+            # del self.gateway
 
     def send_runtest_some(self, indices: Sequence[int]) -> None:
         self.sendcommand("runtests", indices=indices)
@@ -603,6 +381,7 @@ class WorkerController:
             self._shutdown_sent = True
 
     def sendcommand(self, name: str, **kwargs: object) -> None:
+        """Send a named parametrized command to the other side."""
         self.log(f"sending command {name}(**{kwargs})")
         self.channel.send((name, kwargs))
 
@@ -613,12 +392,19 @@ class WorkerController:
     def process_from_remote(
         self, eventcall: tuple[str, dict[str, Any]] | Literal[Marker.END]
     ) -> None:
+        """This gets called for each object we receive from
+        the other side and if the channel closes.
+
+        Note that channel callbacks run in the receiver
+        thread of execnet gateways - we need to
+        avoid raising exceptions or doing heavy work.
+        """
         try:
             if eventcall is Marker.END:
                 err: object | None = self.channel._getremoteerror()  # type: ignore[no-untyped-call]
                 if not self._down:
                     if not err or isinstance(err, EOFError):
-                        err = "Not properly terminated"
+                        err = "Not properly terminated"  # lost connection?
                     self.notify_inproc("errordown", node=self, error=err)
                     self._down = True
                 return
@@ -671,6 +457,7 @@ class WorkerController:
             else:
                 raise ValueError(f"unknown event: {eventname}")
         except KeyboardInterrupt:
+            # should not land in receiver-thread
             raise
         except BaseException:
             excinfo = pytest.ExceptionInfo.from_current()
@@ -693,6 +480,9 @@ def unserialize_warning_message(data: dict[str, Any]) -> warnings.WarningMessage
             except TypeError:
                 pass
         if message is None:
+            # could not recreate the original warning instance;
+            # create a generic Warning instance with the original
+            # message at least
             message_text = "{mod}.{cls}: {msg}".format(
                 mod=data["message_module"],
                 cls=data["message_class_name"],
@@ -709,6 +499,7 @@ def unserialize_warning_message(data: dict[str, Any]) -> warnings.WarningMessage
         category = None
 
     kwargs = {"message": message, "category": category}
+    # access private _WARNING_DETAILS because the attributes vary between Python versions
     for attr_name in warnings.WarningMessage._WARNING_DETAILS:  # type: ignore[attr-defined]
         if attr_name in ("message", "category"):
             continue
