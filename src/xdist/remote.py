@@ -425,31 +425,3 @@ if __name__ == "__channelexec__":
     config.workeroutput = {}  # type: ignore[attr-defined]
     interactor = WorkerInteractor(config, channel)  # type: ignore[name-defined]
     config.hook.pytest_cmdline_main(config=config)
-
-
-class RemoteWorker:
-    """A remote worker that can send commands over a network layer."""
-
-    def __init__(self, network_layer: Any) -> None:
-        self.network_layer = network_layer
-        self.max_retries = 3
-
-    def send_command(self, command: str) -> bool:
-        """
-        Send a command to the remote worker.
-        Returns True if successful, False if connection dropped.
-        Retries on TimeoutError up to max_retries.
-        """
-        retries = 0
-        while retries <= self.max_retries:
-            try:
-                self.network_layer.send(command)
-                return True
-            except TimeoutError:
-                retries += 1
-                if retries > self.max_retries:
-                    raise
-            except ConnectionError:
-                return False
-        return False
-
