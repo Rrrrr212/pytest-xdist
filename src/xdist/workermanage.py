@@ -380,57 +380,10 @@ class WorkerController:
                 pass
             self._shutdown_sent = True
 
-    def sendcommand(
-        self,
-        name: str,
-        **kwargs: object,
-        timeout: float = 10.0,
-        max_retries: int = 3,
-        retry_delay: float = 1.0,
-    ) -> None:
-        """Send a named parametrized command to the other side with timeout and retry support.
-        
-        Args:
-            name: Command name.
-            **kwargs: Command arguments.
-            timeout: Timeout in seconds for each send attempt.
-            max_retries: Maximum number of retries if sending fails.
-            retry_delay: Delay in seconds between retries.
-        
-        Raises:
-            OSError: If the connection is disconnected and cannot be recovered.
-            TimeoutError: If all retry attempts timeout.
-        """
-        import time
+    def sendcommand(self, name: str, **kwargs: object) -> None:
+        """Send a named parametrized command to the other side."""
         self.log(f"sending command {name}(**{kwargs})")
-        
-        last_exception = None
-        for attempt in range(max_retries + 1):
-            try:
-                if self._down:
-                    raise OSError("Worker channel is already down")
-                
-                if self.channel.isclosed():
-                    raise OSError("Channel is closed")
-                
-                self.channel.send((name, kwargs))
-                return
-            except (OSError, EOFError) as e:
-                last_exception = e
-                self.log(f"send failed on attempt {attempt + 1}/{max_retries + 1}: {e}")
-                
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-                else:
-                    raise
-            except Exception as e:
-                last_exception = e
-                self.log(f"unexpected error on send attempt {attempt + 1}/{max_retries + 1}: {e}")
-                
-                if attempt < max_retries:
-                    time.sleep(retry_delay)
-                else:
-                    raise TimeoutError(f"Failed to send command after {max_retries + 1} attempts") from last_exception
+        self.channel.send((name, kwargs))
 
     def notify_inproc(self, eventname: str, **kwargs: object) -> None:
         self.log(f"queuing {eventname}(**{kwargs})")
