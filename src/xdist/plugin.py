@@ -188,6 +188,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadscope",
             "loadfile",
             "loadgroup",
+            "loadbalance",
             "worksteal",
             "no",
         ],
@@ -203,9 +204,30 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadfile: Load balance by sending test grouped by file"
             " to any available environment.\n\n"
             "loadgroup: Like 'load', but sends tests marked with 'xdist_group' to the same worker.\n\n"
+            "loadbalance: Load balance by grouping tests by file and distributing"
+            " them based on weight (file size or historical duration) to avoid"
+            " uneven task distribution. Use with --load-group to specify strategy.\n\n"
             "worksteal: Split the test suite between available environments,"
             " then re-balance when any worker runs out of tests.\n\n"
             "(default) no: Run tests inprocess, don't distribute."
+        ),
+    )
+    group.addoption(
+        "--load-group",
+        dest="loadgroup",
+        action="store",
+        choices=["filesize", "duration", "auto"],
+        default=None,
+        help=(
+            "Specify the strategy for weight-based load balancing when using"
+            " --dist=loadbalance.\n\n"
+            "filesize: Group tests by file and distribute based on file size"
+            " (larger files first). This is the default strategy.\n\n"
+            "duration: Group tests by file and distribute based on historical"
+            " execution duration. Durations are cached in .xdist_durations.json."
+            " Falls back to filesize if no cache exists.\n\n"
+            "auto: Try duration first, fall back to filesize if no duration"
+            " cache is available."
         ),
     )
     group.addoption(
@@ -386,6 +408,9 @@ def _is_distribution_mode(config: pytest.Config) -> bool:
 def pytest_cmdline_main(config: pytest.Config) -> None:
     if config.option.distload:
         config.option.dist = "load"
+
+    if config.option.loadgroup and config.option.dist == "no":
+        config.option.dist = "loadbalance"
 
     usepdb = config.getoption("usepdb", False)  # a core option
     if config.option.numprocesses in ("auto", "logical"):
