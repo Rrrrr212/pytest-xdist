@@ -106,7 +106,7 @@ class NodeManager:
         gw = self.group.makegateway(spec)
         self.config.hook.pytest_xdist_newgateway(gateway=gw)
         self.rsync_roots(gw)
-        node = WorkerController(self, gw, self.config, putevent)
+        node = WorkerControllerFactory.create(self, gw, self.config, putevent)
         # Keep the node alive.
         gw.node = node  # type: ignore[attr-defined]
         node.setup()
@@ -329,28 +329,33 @@ class WorkerController:
         # remote_exec call, which triggers a deadlock error for the
         # main_thread_only execmodel if the rinfo has not been cached.
         self.gateway._rinfo()
-        spec = self.gateway.spec
         args = [str(x) for x in self.config.invocation_params.args or ()]
-        option_dict = {}
-        if not spec.popen or spec.chdir:
-            args = make_reltoroot(self.nodemanager.roots, args)
-        if spec.popen:
-            name = "popen-%s" % self.gateway.id
-            if hasattr(self.config, "_tmp_path_factory"):
-                basetemp = self.config._tmp_path_factory.getbasetemp()
-                option_dict["basetemp"] = str(basetemp / name)
+        option_dict: dict[str, Any] = {}
+        
+        args = self._prepare_args(args)
+        self._prepare_options(option_dict)
+
         self.config.hook.pytest_configure_node(node=self)
 
         remote_module = self.config.hook.pytest_xdist_getremotemodule()
         self.channel = self.gateway.remote_exec(remote_module)
         # change sys.path only for remote workers
         # restore sys.path from a frozen copy for local workers
-        change_sys_path = _sys_path if self.gateway.spec.popen else None
+        change_sys_path = self._get_sys_path()
         self.channel.send((self.workerinput, args, option_dict, change_sys_path))
 
         # putevent is only None in a test.
         if self.putevent:  # type: ignore[truthy-function]
             self.channel.setcallback(self.process_from_remote, endmarker=Marker.END)
+
+    def _prepare_args(self, args: list[str]) -> list[str]:
+        raise NotImplementedError
+
+    def _prepare_options(self, option_dict: dict[str, Any]) -> None:
+        pass
+
+    def _get_sys_path(self) -> Any:
+        return None
 
     def ensure_teardown(self) -> None:
         if hasattr(self, "channel"):
@@ -506,3 +511,64 @@ def unserialize_warning_message(data: dict[str, Any]) -> warnings.WarningMessage
         kwargs[attr_name] = data[attr_name]
 
     return warnings.WarningMessage(**kwargs)
+
+
+class ProcessWorkerController(WorkerController):
+    def _prepare_args(self, args: list[str]) -> list[str]:
+        if self.gateway.spec.chdir:
+            return make_reltoroot(self.nodemanager.roots, args)
+        return args
+
+    def _prepare_options(self, option_dict: dict[str, Any]) -> None:
+        name = "popen-%s" % self.gateway.id
+        if hasattr(self.config, "_tmp_path_factory"):
+            basetemp = self.config._tmp_path_factory.getbasetemp()
+            option_dict["basetemp"] = str(basetemp / name)
+
+    def _get_sys_path(self) -> Any:
+        return _sys_path
+
+
+class ThreadWorkerController(WorkerController):
+    def _prepare_args(self, args: list[str]) -> list[str]:
+        return make_reltoroot(self.nodemanager.roots, args)
+
+
+class RemoteWorkerController(WorkerController):
+    def _prepare_args(self, args: list[str]) -> list[str]:
+        return make_reltoroot(self.nodemanager.roots, args)
+
+
+class WorkerControllerFactory:
+    _worker_classes: dict[str, type[WorkerController]] = {}
+
+    @classmethod
+    def register(cls, worker_type: str, worker_class: type[WorkerController]) -> None:
+        cls._worker_classes[worker_type] = worker_class
+
+    @classmethod
+    def create(
+        cls,
+        nodemanager: NodeManager,
+        gateway: execnet.Gateway,
+        config: pytest.Config,
+        putevent: Callable[[tuple[str, dict[str, Any]]], None],
+    ) -> WorkerController:
+        spec = gateway.spec
+        if getattr(spec, "popen", False):
+            worker_type = "process"
+        elif getattr(spec, "thread", False):
+            worker_type = "thread"
+        else:
+            worker_type = "remote"
+
+        worker_class = cls._worker_classes.get(worker_type)
+        if not worker_class:
+            raise ValueError(f"Unknown worker type: {worker_type}")
+
+        return worker_class(nodemanager, gateway, config, putevent)
+
+
+WorkerControllerFactory.register("process", ProcessWorkerController)
+WorkerControllerFactory.register("thread", ThreadWorkerController)
+WorkerControllerFactory.register("remote", RemoteWorkerController)
