@@ -1,0 +1,75 @@
+diff --git a/src/xdist/dsession.py b/src/xdist/dsession.py
+index 47e1de7..0e3ee8e 100644
+--- a/src/xdist/dsession.py
++++ b/src/xdist/dsession.py
+@@ -21,6 +21,7 @@ from xdist.scheduler import LoadScheduling
+ from xdist.scheduler import LoadScopeScheduling
+ from xdist.scheduler import Scheduling
+ from xdist.scheduler import WorkStealingScheduling
++from xdist.scheduler.loadbalance import LoadBalanceScheduling
+ from xdist.workermanage import NodeManager
+ from xdist.workermanage import WorkerController
+ 
+@@ -121,6 +122,8 @@ class DSession:
+             return LoadFileScheduling(config, log)
+         if dist == "loadgroup":
+             return LoadGroupScheduling(config, log)
++        if dist == "loadbalance":
++            return LoadBalanceScheduling(config, log)
+         if dist == "worksteal":
+             return WorkStealingScheduling(config, log)
+         return None
+diff --git a/src/xdist/plugin.py b/src/xdist/plugin.py
+index d8553ce..22a031b 100644
+--- a/src/xdist/plugin.py
++++ b/src/xdist/plugin.py
+@@ -178,6 +178,14 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+         help="Maximum number of workers that can be restarted "
+         "when crashed (set to zero to disable this feature)",
+     )
++    group.addoption(
++        "--load-group",
++        action="store",
++        dest="loadgroup_strategy",
++        default="none",
++        choices=["none", "size", "history"],
++        help="Strategy to group tests for load balancing (size or history) to avoid uneven distribution.",
++    )
+     group.addoption(
+         "--dist",
+         metavar="distmode",
+@@ -188,6 +196,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "loadscope",
+             "loadfile",
+             "loadgroup",
++            "loadbalance",
+             "worksteal",
+             "no",
+         ],
+@@ -203,6 +212,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
+             "loadfile: Load balance by sending test grouped by file"
+             " to any available environment.\n\n"
+             "loadgroup: Like 'load', but sends tests marked with 'xdist_group' to the same worker.\n\n"
++            "loadbalance: Intelligently group tests based on file size or history execution time.\n\n"
+             "worksteal: Split the test suite between available environments,"
+             " then re-balance when any worker runs out of tests.\n\n"
+             "(default) no: Run tests inprocess, don't distribute."
+@@ -386,6 +396,9 @@ def _is_distribution_mode(config: pytest.Config) -> bool:
+ def pytest_cmdline_main(config: pytest.Config) -> None:
+     if config.option.distload:
+         config.option.dist = "load"
++        
++    if getattr(config.option, "loadgroup_strategy", "none") in ("size", "history"):
++        config.option.dist = "loadbalance"
+ 
+     usepdb = config.getoption("usepdb", False)  # a core option
+     if config.option.numprocesses in ("auto", "logical"):
+diff --git a/src/xdist/scheduler/__init__.py b/src/xdist/scheduler/__init__.py
+index b489473..3b0a41a 100644
+--- a/src/xdist/scheduler/__init__.py
++++ b/src/xdist/scheduler/__init__.py
+@@ -5,3 +5,4 @@ from xdist.scheduler.loadgroup import LoadGroupScheduling as LoadGroupScheduling
+ from xdist.scheduler.loadscope import LoadScopeScheduling as LoadScopeScheduling
+ from xdist.scheduler.protocol import Scheduling as Scheduling
+ from xdist.scheduler.worksteal import WorkStealingScheduling as WorkStealingScheduling
++from xdist.scheduler.loadbalance import LoadBalanceScheduling as LoadBalanceScheduling

@@ -21,6 +21,7 @@ from xdist.scheduler import LoadScheduling
 from xdist.scheduler import LoadScopeScheduling
 from xdist.scheduler import Scheduling
 from xdist.scheduler import WorkStealingScheduling
+from xdist.scheduler.loadbalance import LoadBalanceScheduling
 from xdist.workermanage import NodeManager
 from xdist.workermanage import WorkerController
 
@@ -121,6 +122,8 @@ class DSession:
             return LoadFileScheduling(config, log)
         if dist == "loadgroup":
             return LoadGroupScheduling(config, log)
+        if dist == "loadbalance":
+            return LoadBalanceScheduling(config, log)
         if dist == "worksteal":
             return WorkStealingScheduling(config, log)
         return None

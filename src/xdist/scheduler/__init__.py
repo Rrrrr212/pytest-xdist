@@ -5,3 +5,4 @@ from xdist.scheduler.loadgroup import LoadGroupScheduling as LoadGroupScheduling
 from xdist.scheduler.loadscope import LoadScopeScheduling as LoadScopeScheduling
 from xdist.scheduler.protocol import Scheduling as Scheduling
 from xdist.scheduler.worksteal import WorkStealingScheduling as WorkStealingScheduling
+from xdist.scheduler.loadbalance import LoadBalanceScheduling as LoadBalanceScheduling
