@@ -4,8 +4,4 @@ from xdist.scheduler.loadfile import LoadFileScheduling as LoadFileScheduling
 from xdist.scheduler.loadgroup import LoadGroupScheduling as LoadGroupScheduling
 from xdist.scheduler.loadscope import LoadScopeScheduling as LoadScopeScheduling
 from xdist.scheduler.protocol import Scheduling as Scheduling
-from xdist.scheduler.smartloadgroup import SmartLoadGroupScheduling as SmartLoadGroupScheduling
-from xdist.scheduler.smartloadgroup import get_test_file_size as get_test_file_size
-from xdist.scheduler.smartloadgroup import get_historical_execution_time as get_historical_execution_time
-from xdist.scheduler.smartloadgroup import save_execution_time as save_execution_time
 from xdist.scheduler.worksteal import WorkStealingScheduling as WorkStealingScheduling

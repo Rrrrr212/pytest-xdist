@@ -303,19 +303,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "Unlimited if not set."
         ),
     )
-    group.addoption(
-        "--load-group",
-        action="store",
-        choices=["size", "time"],
-        dest="loadgroup",
-        default=None,
-        help=(
-            "Set grouping strategy for test load balancing.\n\n"
-            "size: Group tests by file size to balance workload.\n\n"
-            "time: Group tests by historical execution time to balance workload.\n\n"
-            "Only works with --dist=loadfile or custom smart load balancing."
-        ),
-    )
 
     parser.addini(
         "rsyncdirs",
