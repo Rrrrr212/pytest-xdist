@@ -364,6 +364,41 @@ def test_remote_inner_argv(pytester: pytest.Pytester) -> None:
     assert result.ret == 0
 
 
+import unittest.mock
+from xdist.remote import RemoteWorker
+
+def test_remoteworker_send_command_success() -> None:
+    network_layer = unittest.mock.Mock()
+    worker = RemoteWorker(network_layer)
+    
+    result = worker.send_command("test_command")
+    
+    assert result is True
+    network_layer.send.assert_called_once_with("test_command")
+
+def test_remoteworker_send_command_timeout_retry() -> None:
+    network_layer = unittest.mock.Mock()
+    # Fail twice with TimeoutError, then succeed
+    network_layer.send.side_effect = [TimeoutError, TimeoutError, None]
+    worker = RemoteWorker(network_layer)
+    
+    result = worker.send_command("test_command")
+    
+    assert result is True
+    assert network_layer.send.call_count == 3
+
+def test_remoteworker_send_command_connection_disconnect() -> None:
+    network_layer = unittest.mock.Mock()
+    network_layer.send.side_effect = ConnectionError
+    worker = RemoteWorker(network_layer)
+    
+    result = worker.send_command("test_command")
+    
+    assert result is False
+    network_layer.send.assert_called_once_with("test_command")
+
+
+
 def test_remote_mainargv(pytester: pytest.Pytester) -> None:
     outer_argv = sys.argv
 
