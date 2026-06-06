@@ -94,7 +94,7 @@ class RemoteControl:
             args=self.config.args,
             option_dict=vars(self.config.option),
         )
-        remote_outchannel: execnet.Channel = channel.receive()
+        self.remote_outchannel = remote_outchannel = channel.receive()
 
         out = TerminalWriter()
 
@@ -110,6 +110,12 @@ class RemoteControl:
                 self.trace("closing", self.channel)
                 self.channel.close()
             del self.channel
+        if hasattr(self, "remote_outchannel"):
+            self.remote_outchannel.setcallback(None)
+            if not self.remote_outchannel.isclosed():
+                self.trace("closing", self.remote_outchannel)
+                self.remote_outchannel.close()
+            del self.remote_outchannel
         if hasattr(self, "gateway"):
             self.trace("exiting", self.gateway)
             self.gateway.exit()
