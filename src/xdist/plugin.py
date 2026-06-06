@@ -179,14 +179,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "when crashed (set to zero to disable this feature)",
     )
     group.addoption(
-        "--load-group",
-        action="store",
-        dest="loadgroup_strategy",
-        default="none",
-        choices=["none", "size", "history"],
-        help="Strategy to group tests for load balancing (size or history) to avoid uneven distribution.",
-    )
-    group.addoption(
         "--dist",
         metavar="distmode",
         action="store",
@@ -196,7 +188,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadscope",
             "loadfile",
             "loadgroup",
-            "loadbalance",
             "worksteal",
             "no",
         ],
@@ -212,7 +203,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "loadfile: Load balance by sending test grouped by file"
             " to any available environment.\n\n"
             "loadgroup: Like 'load', but sends tests marked with 'xdist_group' to the same worker.\n\n"
-            "loadbalance: Intelligently group tests based on file size or history execution time.\n\n"
             "worksteal: Split the test suite between available environments,"
             " then re-balance when any worker runs out of tests.\n\n"
             "(default) no: Run tests inprocess, don't distribute."
@@ -396,9 +386,6 @@ def _is_distribution_mode(config: pytest.Config) -> bool:
 def pytest_cmdline_main(config: pytest.Config) -> None:
     if config.option.distload:
         config.option.dist = "load"
-        
-    if getattr(config.option, "loadgroup_strategy", "none") in ("size", "history"):
-        config.option.dist = "loadbalance"
 
     usepdb = config.getoption("usepdb", False)  # a core option
     if config.option.numprocesses in ("auto", "logical"):
